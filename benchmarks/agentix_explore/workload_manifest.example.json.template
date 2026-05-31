@@ -1,0 +1,67 @@
+{
+  "description": "Reasoning manifest for Agentix motivation replication.",
+  "program_arrival": {
+    "distribution": "poisson",
+    "unit": "programs_per_second",
+    "rates_to_sweep": [0.1, 0.2, 0.4, 0.8]
+  },
+  "workloads": [
+    {
+      "name": "sharegpt",
+      "role": "chatbot program",
+      "source": "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered",
+      "local_path": "/path/to/ShareGPT_V3_unfiltered_cleaned_split.json",
+      "conversion_notes": [
+        "Treat each full conversation as one program.",
+        "Each assistant turn is one LLM call.",
+        "Preserve prompt growth across turns."
+      ]
+    },
+    {
+      "name": "bfcl",
+      "role": "ReAct and function-calling program",
+      "source": "https://huggingface.co/datasets/gorilla-llm/Berkeley-Function-Calling-Leaderboard",
+      "local_path": "/path/to/BFCL/jsonl/files",
+      "conversion_notes": [
+        "Use multi-turn categories.",
+        "Treat one task as one program.",
+        "Record tool names and inter-request gaps when available."
+      ]
+    },
+    {
+      "name": "lats_hotpotqa",
+      "role": "MCTS DAG program",
+      "source": "https://github.com/lapisrocks/LanguageAgentTreeSearch",
+      "local_path": "/path/to/lats/generated/traces.jsonl",
+      "conversion_notes": [
+        "Use HotpotQA tasks as roots.",
+        "Record parent_call_ids for tree-search dependencies.",
+        "Preserve fanout, critical path, prompt tokens, and output tokens."
+      ]
+    },
+    {
+      "name": "swe_bench_mini_swe_agent",
+      "role": "coding-agent limitation probe",
+      "source": "https://www.swebench.com/",
+      "local_path": "/path/to/coding-agent/traces.jsonl",
+      "conversion_notes": [
+        "Use one repository issue as one program.",
+        "Record shell/editor tool names and tool latency.",
+        "Keep pass/fail and timeout metadata at program level."
+      ]
+    }
+  ],
+  "metrics": [
+    "calls_per_program",
+    "prompt_tokens_per_call",
+    "output_tokens_per_call",
+    "program_wait_s",
+    "program_execution_s",
+    "call_wait_execution_ratio",
+    "program_wait_execution_ratio",
+    "intra_program_prefix_lcp_rate",
+    "inter_program_prefix_lcp_rate",
+    "attained_service_remaining_work_correlation"
+  ]
+}
+
