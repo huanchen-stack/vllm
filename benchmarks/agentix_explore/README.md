@@ -63,6 +63,14 @@ optional, but they are needed for Agentix Figure 5/6/7 style measurements.
    Request ids should use `program_id::call_id` if the downstream analysis
    needs to recover program membership from vLLM scheduler events.
 
+6. Convert the scheduler trace into the call-trace schema for offline checks:
+
+   ```bash
+   .venv/bin/python benchmarks/agentix_explore/merge_scheduler_trace.py \
+     --scheduler-jsonl /tmp/agentix-scheduler.jsonl \
+     --output-jsonl /tmp/agentix-scheduler-calls.jsonl
+   ```
+
 ## Why This Is Separate From `vllm bench serve`
 
 `vllm bench serve` is request-oriented. Agentix motivation needs

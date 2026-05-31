@@ -1,0 +1,61 @@
+# Example matrix for Agentix-style evaluation planning.
+
+[workload.sharegpt]
+source = "ShareGPT conversation traces"
+purpose = "Conversation-shaped multi-turn baseline"
+request_id_format = "program_id::call_id"
+expected_gap = "Weak DAG structure; useful as a control, not a full agent trace"
+
+[workload.bfcl]
+source = "Berkeley Function Calling Leaderboard"
+purpose = "Tool-call-oriented request traces"
+request_id_format = "program_id::call_id"
+expected_gap = "Tool execution timing must be replayed or modeled separately"
+
+[workload.hotpotqa_lats]
+source = "HotpotQA with LATS-style tree search traces"
+purpose = "Search-like branching and fan-in"
+request_id_format = "program_id::call_id"
+expected_gap = "Need to preserve branch dependencies and pruning decisions"
+
+[workload.coding_agent]
+source = "SWE-bench style or recorded coding-agent traces"
+purpose = "Long-turn agentic coding workload not well covered by Agentix"
+request_id_format = "program_id::call_id"
+expected_gap = "Repository context and tool feedback can dominate prefix locality"
+
+[config.vllm_baseline]
+trace_enabled = false
+kv_offload = false
+purpose = "Throughput and latency baseline"
+
+[config.vllm_traced]
+trace_enabled = true
+kv_offload = false
+purpose = "Measure scheduler lifecycle with opt-in Agentix trace"
+
+[config.vllm_offload]
+trace_enabled = false
+kv_offload = true
+purpose = "Host/device KV pressure baseline"
+
+[config.vllm_offload_traced]
+trace_enabled = true
+kv_offload = true
+purpose = "KV pressure plus scheduler lifecycle trace"
+
+[metric.call_wait_ratio]
+definition = "queue wait divided by execution span"
+source = "joined client and scheduler trace"
+
+[metric.program_slowdown]
+definition = "program latency versus isolated or low-load replay"
+source = "client DAG plus scheduler finish timestamps"
+
+[metric.slo_miss_rate]
+definition = "fraction of calls or programs missing workload-specific SLO"
+source = "joined trace and workload manifest"
+
+[metric.kv_transfer_cost]
+definition = "KV offload/reload bytes and transfer time"
+source = "future transfer timing instrumentation"
