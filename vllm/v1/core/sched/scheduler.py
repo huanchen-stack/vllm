@@ -35,6 +35,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.sched.agentix_trace import AgentixTraceSink
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -165,6 +166,10 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+        # AGENTIX EXPLORE: opt-in scheduler event trace for motivation
+        # experiment replication. Disabled unless AGENTIX_EXPLORE_TRACE_JSONL
+        # is set, so normal vLLM serving behavior remains unchanged.
+        self.agentix_trace = AgentixTraceSink.from_env()
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -502,6 +507,13 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
+            self.agentix_trace.emit(
+                "scheduled_running",
+                request,
+                scheduled_timestamp,
+                scheduled_tokens=num_new_tokens,
+                remaining_token_budget=token_budget,
+            )
 
             # Speculative decode related.
             if request.spec_token_ids:
@@ -770,6 +782,13 @@ class Scheduler(SchedulerInterface):
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    self.agentix_trace.emit(
+                        "waiting_for_remote_kv",
+                        request,
+                        scheduled_timestamp,
+                        external_cached_tokens=num_external_computed_tokens,
+                        local_cached_tokens=num_new_local_computed_tokens,
+                    )
                     step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until
@@ -794,8 +813,10 @@ class Scheduler(SchedulerInterface):
                     )
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
+                    agentix_event = "scheduled_new"
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
+                    agentix_event = "scheduled_resumed"
                 else:
                     raise RuntimeError(f"Invalid request status: {request.status}")
 
@@ -808,6 +829,15 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                self.agentix_trace.emit(
+                    agentix_event,
+                    request,
+                    scheduled_timestamp,
+                    scheduled_tokens=num_new_tokens,
+                    local_cached_tokens=num_new_local_computed_tokens,
+                    external_cached_tokens=num_external_computed_tokens,
+                    remaining_token_budget=token_budget,
+                )
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
@@ -907,6 +937,18 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
         )
+        self.agentix_trace.emit_step(
+            timestamp_s=scheduled_timestamp,
+            waiting_count=len(self.waiting),
+            running_count=len(self.running),
+            skipped_waiting_count=len(self.skipped_waiting),
+            total_num_scheduled_tokens=total_num_scheduled_tokens,
+            scheduled_new_count=len(scheduled_new_reqs),
+            scheduled_resumed_count=len(scheduled_resumed_reqs),
+            scheduled_running_count=len(scheduled_running_reqs),
+            preempted_count=len(preempted_reqs),
+            finished_count=len(self.finished_req_ids),
+        )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -950,6 +992,7 @@ class Scheduler(SchedulerInterface):
         request.num_preemptions += 1
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
+        self.agentix_trace.emit("preempted", request, timestamp)
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
@@ -1781,6 +1824,7 @@ class Scheduler(SchedulerInterface):
                 self.connector.on_new_request(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+            self.agentix_trace.emit("queued", request)
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -1860,6 +1904,13 @@ class Scheduler(SchedulerInterface):
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:
             self._free_blocks(request)
+        self.agentix_trace.emit(
+            "finished",
+            request,
+            delay_free_blocks=delay_free_blocks,
+            connector_delay_free_blocks=connector_delay_free_blocks,
+            has_kv_transfer_params=kv_xfer_params is not None,
+        )
 
         return kv_xfer_params
 

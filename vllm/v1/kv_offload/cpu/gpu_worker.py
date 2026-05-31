@@ -326,6 +326,10 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         with torch.cuda.stream(stream):
             start_event.record(stream)
             if num_copy_ops > 0:
+                # AGENTIX EXPLORE: this is the transparent host/device KV
+                # batching hook for the Agentix paper's transfer motivation.
+                # The custom op uses cuMemcpyBatchAsync where available and
+                # falls back internally, so no scheduling semantics change.
                 ops.swap_blocks_batch(
                     batch_src,
                     batch_dst,

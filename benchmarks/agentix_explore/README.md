@@ -52,7 +52,16 @@ optional, but they are needed for Agentix Figure 5/6/7 style measurements.
    - intra-program prefix locality is higher than inter-program locality;
    - attained service correlates with remaining work.
 
-5. Only after the trace looks right should scheduler instrumentation be added.
+5. Enable the experimental scheduler trace only after the workload semantics
+   look right:
+
+   ```bash
+   AGENTIX_EXPLORE_TRACE_JSONL=/tmp/agentix-scheduler.jsonl \
+     vllm serve ...
+   ```
+
+   Request ids should use `program_id::call_id` if the downstream analysis
+   needs to recover program membership from vLLM scheduler events.
 
 ## Why This Is Separate From `vllm bench serve`
 
