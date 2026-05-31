@@ -19,6 +19,33 @@ coding agent can all be "agentic" while having different notions of success:
 An evaluation that reports only aggregate wait/execution ratios can miss these
 differences.
 
+## External Interrupts
+
+Agentix cleanly separates program latency into LLM-engine waiting time, LLM
+execution time, and external interruptions. It then focuses on the first two.
+That is a reasonable serving-engine boundary, but it is also a major
+evaluation risk because external interruptions can dominate real agent loops.
+
+The runtime DAG and process table help Agentix track calls after they arrive:
+program/session membership, call arrival, waiting time, service time, and
+critical-path-style metadata for multi-threaded programs. They do not solve the
+workload-specific process that creates the next call. Chatbot agents can wait
+on human thinking, search agents can wait on web or database checks, and coding
+agents can wait on tests, builds, profiling, and file I/O.
+
+Therefore Agentix is program-aware inside the LLM serving layer, but it is not
+a full agent-runtime scheduler. An evaluation should vary the external
+interrupt ratio:
+
+```text
+external_interrupt_time / (llm_wait_time + llm_execution_time)
+```
+
+If this ratio is high, improved LLM-call scheduling may barely move end-to-end
+task latency even if it improves engine-local waiting time. If it is low, or if
+many calls become ready in bursts, Agentix-style scheduling is more likely to
+matter.
+
 ## Workload Limitations To Probe
 
 Coding-agent workloads are the most important gap. They can have many turns,
@@ -50,6 +77,8 @@ Before accepting an Agentix-style scheduler, the evaluation should answer:
   search snippets, or generated tool output?
 - Does KV transfer batching matter compared with scheduler wait and model
   execution?
+- At what external-interrupt ratio do scheduling gains stop changing
+  end-to-end task latency or SLO goodput?
 - Are improvements still visible under realistic arrival bursts rather than a
   trace replay with convenient pacing?
 

@@ -49,6 +49,34 @@ Continuum highlights two missing costs:
 - per-turn queueing delay: after a tool returns, the next LLM request must
   queue behind unrelated work even if the program is logically continuous
 
+### External Interrupts Can Dominate
+
+Agentix decomposes program latency into LLM-engine waiting time, LLM execution
+time, and external interruptions such as human input or tool calls. Its
+motivation focuses on reducing waiting and execution time inside the serving
+engine. That boundary is clean, but it can hide the dominant term in many
+agentic workloads.
+
+Different task classes create different intra-program LLM-call arrival
+patterns:
+
+- chatbot agents wait on human thinking and typing between turns
+- search agents wait on web fetches, database checks, parsing, and reranking
+- coding agents wait on shell commands, tests, builds, profiling, and file I/O
+- data-analysis agents wait on SQL queries, notebook execution, or remote jobs
+
+Agentix's runtime DAG/process-table construction can observe new LLM calls when
+they arrive and can track parent or critical-path metadata for active calls. It
+does not model, predict, or optimize the external process that decides when the
+next call becomes ready. As a result, Agentix can be very relevant when many
+LLM calls are ready or when serving wait dominates, but much less relevant when
+external interrupts dominate end-to-end task time.
+
+This should be an explicit replication axis: vary
+`external_interrupt_time / (llm_wait_time + llm_execution_time)` and measure
+when Agentix-style scheduling still changes end-to-end latency, SLO goodput, or
+completed-task rate.
+
 ### SLO Heterogeneity
 
 Agentix mainly reports throughput at equal latency and program-level token
@@ -207,4 +235,3 @@ two questions before running a server:
    tool gaps, and high value from retaining KV between tool calls?
 
 Only after that should we implement scheduler or cache-retention experiments.
-
