@@ -278,6 +278,15 @@ if TYPE_CHECKING:
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
+    ROLLOUT_QLORA: bool = False
+    VLLM_DUAL_PRECISION_ROLLOUT: bool = False
+    VLLM_DUAL_PRECISION_INT4_MODEL: str = ""
+    VLLM_DUAL_PRECISION_THRESHOLD: int = 16
+    VLLM_DUAL_PRECISION_REPREFILL: bool = False
+    VLLM_REPREFILL_ONLY_ROLLOUT: bool = False
+    VLLM_CUDA_PROFILER_DECODE_STEPS: int = 0
+    VLLM_CUDA_PROFILER_DECODE_SKIP_STEPS: int = 0
+    VLLM_CUDA_PROFILER_OUTPUT_DIR: str = ""
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
 
@@ -1971,6 +1980,44 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # overlap the base layer compute with the LoRA fast path).
     "VLLM_LORA_ENABLE_DUAL_STREAM": lambda: bool(
         int(os.getenv("VLLM_LORA_ENABLE_DUAL_STREAM", "0"))
+    ),
+    # Enable the ours QLoRA rollout fast path.
+    "ROLLOUT_QLORA": lambda: bool(int(os.getenv("ROLLOUT_QLORA", "0"))),
+    # Enable dual-precision rollout for the ours QLoRA path. When enabled,
+    # batches with active LoRA use BF16 base weights above the threshold and
+    # INT4 shadow base weights at or below the threshold.
+    "VLLM_DUAL_PRECISION_ROLLOUT": lambda: bool(
+        int(os.getenv("VLLM_DUAL_PRECISION_ROLLOUT", "0"))
+    ),
+    # Path/name of the INT4 checkpoint to load as the shadow base model.
+    "VLLM_DUAL_PRECISION_INT4_MODEL": lambda: os.getenv(
+        "VLLM_DUAL_PRECISION_INT4_MODEL", ""
+    ),
+    # Batch-size threshold for switching to INT4 shadow base weights.
+    "VLLM_DUAL_PRECISION_THRESHOLD": lambda: int(
+        os.getenv("VLLM_DUAL_PRECISION_THRESHOLD", "16")
+    ),
+    # Recompute survivor KV under INT4 when dual precision first crosses the
+    # runtime request-count threshold.
+    "VLLM_DUAL_PRECISION_REPREFILL": lambda: bool(
+        int(os.getenv("VLLM_DUAL_PRECISION_REPREFILL", "0"))
+    ),
+    # Recompute survivor KV at the threshold without changing precision. This is
+    # an experiment-only control for isolating re-prefill from INT4 switching.
+    "VLLM_REPREFILL_ONLY_ROLLOUT": lambda: bool(
+        int(os.getenv("VLLM_REPREFILL_ONLY_ROLLOUT", "0"))
+    ),
+    # Worker-side cudaProfilerStart/Stop window for decode-only Nsight runs.
+    "VLLM_CUDA_PROFILER_DECODE_STEPS": lambda: int(
+        os.getenv("VLLM_CUDA_PROFILER_DECODE_STEPS", "0")
+    ),
+    # Number of decode-only steps to skip before starting the profiler window.
+    "VLLM_CUDA_PROFILER_DECODE_SKIP_STEPS": lambda: int(
+        os.getenv("VLLM_CUDA_PROFILER_DECODE_SKIP_STEPS", "0")
+    ),
+    # Directory where worker-side decode profiler metadata is written.
+    "VLLM_CUDA_PROFILER_OUTPUT_DIR": lambda: os.getenv(
+        "VLLM_CUDA_PROFILER_OUTPUT_DIR", ""
     ),
     # If set to 1, use Python spinloop extension to poll in a more efficient
     # way when using the mp backend.

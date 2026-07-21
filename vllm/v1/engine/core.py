@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import json
 import os
 import queue
 import signal
@@ -46,6 +47,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     generate_scheduler_kv_cache_config,
     get_kv_cache_configs,
+    get_max_concurrency_for_kv_cache_config,
     get_request_block_hasher,
     init_none_hash,
     resolve_kv_cache_block_sizes,
@@ -221,6 +223,13 @@ class EngineCore:
         self.aborts_queue = queue.Queue[list[str]]()
 
         self._idle_state_callbacks: list[Callable] = []
+        self._step_timing_index = 0
+        self._step_timing_output_dir = envs.VLLM_CUDA_PROFILER_OUTPUT_DIR
+        self._step_timing_path = (
+            os.path.join(self._step_timing_output_dir, "engine_step_timing.jsonl")
+            if self._step_timing_output_dir
+            else ""
+        )
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
@@ -333,6 +342,34 @@ class EngineCore:
                 }
             )
         return metadata
+
+    def get_kv_cache_capacity_metadata(self) -> dict[str, int | float]:
+        """Return msgspec-serializable KV cache capacity metadata."""
+        kv_cache_config = getattr(self.scheduler, "kv_cache_config", None)
+        if kv_cache_config is None:
+            return {}
+
+        max_concurrency = get_max_concurrency_for_kv_cache_config(
+            self.vllm_config, kv_cache_config
+        )
+        kv_capacity_tokens = int(
+            max_concurrency * self.vllm_config.model_config.max_model_len
+        )
+        per_rank_kv_capacity_bytes = sum(
+            tensor.size for tensor in kv_cache_config.kv_cache_tensors
+        )
+        total_kv_capacity_bytes = (
+            per_rank_kv_capacity_bytes
+            * self.vllm_config.parallel_config.world_size
+        )
+
+        return {
+            "kv_capacity_tokens": kv_capacity_tokens,
+            "per_rank_kv_capacity_bytes": per_rank_kv_capacity_bytes,
+            "total_kv_capacity_bytes": total_kv_capacity_bytes,
+            "num_blocks": kv_cache_config.num_blocks,
+            "world_size": self.vllm_config.parallel_config.world_size,
+        }
 
     def add_request(self, request: Request, request_wave: int = 0):
         """Add request to the scheduler.
@@ -477,6 +514,49 @@ class EngineCore:
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
 
+    def _new_engine_step_timing(
+        self,
+        batch_queue_len: int,
+    ) -> dict[str, Any] | None:
+        if not self._step_timing_path:
+            return None
+        self._step_timing_index += 1
+        return {
+            "step": self._step_timing_index,
+            "pid": os.getpid(),
+            "time_ns": time.time_ns(),
+            "perf_start_ns": time.perf_counter_ns(),
+            "batch_queue_start": batch_queue_len,
+            "batch_queue_size": self.batch_queue_size,
+            "async_scheduling": self.async_scheduling,
+        }
+
+    @staticmethod
+    def _record_engine_step_phase(
+        timing: dict[str, Any] | None,
+        phase: str,
+        start_ns: int,
+    ) -> None:
+        if timing is None:
+            return
+        timing[f"{phase}_ms"] = (time.perf_counter_ns() - start_ns) / 1e6
+
+    def _write_engine_step_timing(
+        self,
+        timing: dict[str, Any] | None,
+        **extra: Any,
+    ) -> None:
+        if timing is None:
+            return
+        timing.update(extra)
+        timing["total_ms"] = (
+            time.perf_counter_ns() - int(timing["perf_start_ns"])
+        ) / 1e6
+        timing.pop("perf_start_ns", None)
+        os.makedirs(self._step_timing_output_dir, exist_ok=True)
+        with open(self._step_timing_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(timing, sort_keys=True) + "\n")
+
     def step_with_batch_queue(
         self,
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
@@ -496,6 +576,7 @@ class EngineCore:
 
         batch_queue = self.batch_queue
         assert batch_queue is not None
+        timing = self._new_engine_step_timing(len(batch_queue))
 
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
@@ -505,14 +586,27 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
+            phase_start = time.perf_counter_ns()
             scheduler_output = self.scheduler.schedule()
-            with self.log_error_detail(scheduler_output):
-                exec_future = self.model_executor.execute_model(
-                    scheduler_output, non_block=True
+            self._record_engine_step_phase(timing, "schedule", phase_start)
+            if timing is not None:
+                timing["scheduled_tokens"] = (
+                    scheduler_output.total_num_scheduled_tokens
+                )
+                timing["scheduled_reqs"] = len(
+                    scheduler_output.num_scheduled_tokens
                 )
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
+            with self.log_error_detail(scheduler_output):
+                phase_start = time.perf_counter_ns()
+                exec_future = self.model_executor.execute_model(
+                    scheduler_output, non_block=True
+                )
+                self._record_engine_step_phase(
+                    timing, "execute_model_enqueue", phase_start
+                )
             if self.is_pooling_model or not model_executed:
                 # No sampling required (no requests scheduled).
                 future = cast(Future[ModelRunnerOutput], exec_future)
@@ -520,11 +614,19 @@ class EngineCore:
                 if not scheduler_output.pending_structured_output_tokens:
                     # We aren't waiting for any tokens, get any grammar output
                     # and sample immediately.
+                    phase_start = time.perf_counter_ns()
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )
+                    self._record_engine_step_phase(
+                        timing, "grammar_bitmask", phase_start
+                    )
+                    phase_start = time.perf_counter_ns()
                     future = self.model_executor.sample_tokens(
                         grammar_output, non_block=True
+                    )
+                    self._record_engine_step_phase(
+                        timing, "sample_enqueue", phase_start
                     )
                 else:
                     # We need to defer sampling until we have processed the model output
@@ -539,14 +641,24 @@ class EngineCore:
                     and len(batch_queue) < self.batch_queue_size
                     and not batch_queue[-1][0].done()
                 ):
-                    # Don't block on next worker response unless the queue is full
-                    # or there are no more requests to schedule.
+                    self._write_engine_step_timing(
+                        timing,
+                        returned="fill_queue",
+                        model_executed=model_executed,
+                        batch_queue_end=len(batch_queue),
+                    )
                     return None, True
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should
             # only be called when the scheduler contains requests or the queue
             # is non-empty.
+            self._write_engine_step_timing(
+                timing,
+                returned="empty",
+                model_executed=False,
+                batch_queue_end=0,
+            )
             return None, False
 
         # Block until the next result is available.
@@ -555,7 +667,9 @@ class EngineCore:
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
+            phase_start = time.perf_counter_ns()
             model_output = future.result()
+            self._record_engine_step_phase(timing, "future_wait", phase_start)
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
@@ -564,10 +678,14 @@ class EngineCore:
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
+        phase_start = time.perf_counter_ns()
         self._process_aborts_queue()
+        self._record_engine_step_phase(timing, "process_aborts", phase_start)
+        phase_start = time.perf_counter_ns()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        self._record_engine_step_phase(timing, "update_from_output", phase_start)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -587,12 +705,27 @@ class EngineCore:
                 )
             # We now have the tokens needed to compute the bitmask for the
             # deferred request. Get the bitmask and call sample tokens.
+            phase_start = time.perf_counter_ns()
             grammar_output = self.scheduler.get_grammar_bitmask(
                 deferred_scheduler_output
             )
+            self._record_engine_step_phase(
+                timing, "deferred_grammar_bitmask", phase_start
+            )
+            phase_start = time.perf_counter_ns()
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
+            self._record_engine_step_phase(
+                timing, "deferred_sample_enqueue", phase_start
+            )
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
+        self._write_engine_step_timing(
+            timing,
+            returned="outputs",
+            model_executed=model_executed,
+            batch_queue_end=len(batch_queue),
+            output_groups=len(engine_core_outputs),
+        )
         return engine_core_outputs, model_executed
 
     def _process_aborts_queue(self):

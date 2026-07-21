@@ -4,6 +4,8 @@
 import functools
 import gc
 import itertools
+import json
+import os
 import threading
 import time
 from collections import defaultdict
@@ -55,6 +57,12 @@ from vllm.forward_context import (
 )
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
+from vllm.model_executor.dual_precision import (
+    DUAL_PRECISION_SHADOW_MODEL_REF_ATTR,
+    bind_dual_precision_lora_base_layer,
+    load_and_attach_int4_shadow_model,
+    register_int4_shadow_model,
+)
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
@@ -244,6 +252,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         async_output_copy_stream: torch.cuda.Stream,
         vocab_size: int,
         routed_experts: RoutedExpertsTensors | None = None,
+        routed_experts_cpu_buffer: RoutedExpertsTensors | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -271,7 +280,9 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 else None
             )
             self._routed_experts_cpu = (
-                self._routed_experts.to_cpu_nonblocking()
+                self._routed_experts.copy_to_cpu_nonblocking(
+                    routed_experts_cpu_buffer
+                )
                 if self._routed_experts is not None
                 else None
             )
@@ -898,6 +909,15 @@ class GPUModelRunner(
                 self.max_num_reqs, dtype=torch.int32
             )
         self.layerwise_nvtx_hooks_registered = False
+        self._cuda_profiler_decode_steps = envs.VLLM_CUDA_PROFILER_DECODE_STEPS
+        self._cuda_profiler_decode_skip_steps = (
+            envs.VLLM_CUDA_PROFILER_DECODE_SKIP_STEPS
+        )
+        self._cuda_profiler_seen_decode_steps = 0
+        self._cuda_profiler_decode_iterations = 0
+        self._cuda_profiler_started = False
+        self._cuda_profiler_stopped = self._cuda_profiler_decode_steps <= 0
+        self._cuda_profiler_output_dir = envs.VLLM_CUDA_PROFILER_OUTPUT_DIR
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -3959,6 +3979,119 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
+    def _cuda_decode_profiler_rank(self) -> int:
+        try:
+            return get_tp_group().rank_in_group
+        except Exception:
+            return envs.LOCAL_RANK
+
+    def _write_cuda_decode_profiler_state(self) -> None:
+        if not self._cuda_profiler_output_dir:
+            return
+        rank = self._cuda_decode_profiler_rank()
+        payload = {
+            "rank": rank,
+            "pid": os.getpid(),
+            "started": self._cuda_profiler_started,
+            "stopped": self._cuda_profiler_stopped,
+            "skipped_decode_steps": self._cuda_profiler_decode_skip_steps,
+            "seen_decode_steps": self._cuda_profiler_seen_decode_steps,
+            "decode_iterations": self._cuda_profiler_decode_iterations,
+            "max_decode_iterations": self._cuda_profiler_decode_steps,
+        }
+        output_dir = envs.VLLM_CUDA_PROFILER_OUTPUT_DIR
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(
+            output_dir,
+            f"cuda_profiler_decode_window_rank{rank}.json",
+        )
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        if rank == 0:
+            with open(
+                os.path.join(output_dir, "cuda_profiler_decode_window.json"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(payload, f, indent=2)
+
+    def _sync_cuda_decode_profiler_tp_ranks(self) -> None:
+        if not torch.distributed.is_initialized():
+            return
+        get_tp_group().barrier()
+
+    def _is_cuda_profiler_decode_step(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+        max_num_scheduled_tokens: int,
+    ) -> bool:
+        if self._cuda_profiler_stopped:
+            return False
+        if scheduler_output.scheduled_new_reqs:
+            return False
+        if scheduler_output.scheduled_encoder_inputs:
+            return False
+        if max_num_scheduled_tokens != 1:
+            return False
+        return scheduler_output.total_num_scheduled_tokens == num_reqs
+
+    def _maybe_start_cuda_decode_profiler(self, is_decode_step: bool) -> None:
+        if (
+            not is_decode_step
+            or self._cuda_profiler_started
+            or self._cuda_profiler_stopped
+        ):
+            return
+        self._cuda_profiler_seen_decode_steps += 1
+        if (
+            self._cuda_profiler_seen_decode_steps
+            <= self._cuda_profiler_decode_skip_steps
+        ):
+            self._write_cuda_decode_profiler_state()
+            return
+        rank = self._cuda_decode_profiler_rank()
+        torch.cuda.synchronize()
+        self._sync_cuda_decode_profiler_tp_ranks()
+        torch.cuda.cudart().cudaProfilerStart()
+        self._cuda_profiler_started = True
+        self._sync_cuda_decode_profiler_tp_ranks()
+        logger.info(
+            "Started CUDA decode profiler on rank %s for %s decode steps "
+            "after skipping %s decode steps.",
+            rank,
+            self._cuda_profiler_decode_steps,
+            self._cuda_profiler_decode_skip_steps,
+        )
+        self._write_cuda_decode_profiler_state()
+
+    def _maybe_stop_cuda_decode_profiler(self, is_decode_step: bool) -> None:
+        if (
+            not is_decode_step
+            or not self._cuda_profiler_started
+            or self._cuda_profiler_stopped
+        ):
+            return
+        self._cuda_profiler_decode_iterations += 1
+        if self._cuda_profiler_decode_iterations < self._cuda_profiler_decode_steps:
+            self._write_cuda_decode_profiler_state()
+            return
+        rank = self._cuda_decode_profiler_rank()
+        torch.cuda.synchronize()
+        # Nsight closes the global cudaProfilerApi capture on the first
+        # cudaProfilerStop it observes. Let every TP rank request stop instead
+        # of routing through rank 0, so a slow rank-0 control path cannot keep
+        # the capture open far past the requested decode window.
+        time.sleep(0.05)
+        torch.cuda.cudart().cudaProfilerStop()
+        self._cuda_profiler_stopped = True
+        logger.info(
+            "Stopped CUDA decode profiler on rank %s after %s decode steps.",
+            rank,
+            self._cuda_profiler_decode_iterations,
+        )
+        self._write_cuda_decode_profiler_state()
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -4043,6 +4176,11 @@ class GPUModelRunner(
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+            is_profiler_decode_step = self._is_cuda_profiler_decode_step(
+                scheduler_output,
+                num_reqs,
+                max_num_scheduled_tokens,
+            )
 
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
@@ -4213,6 +4351,13 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
+        bind_dual_precision_lora_base_layer(
+            self.model,
+            batch_desc.base_precision,
+            self.compilation_config.static_forward_context,
+        )
+        self._maybe_start_cuda_decode_profiler(is_profiler_decode_step)
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
@@ -4243,6 +4388,7 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+        self._maybe_stop_cuda_decode_profiler(is_profiler_decode_step)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4555,6 +4701,7 @@ class GPUModelRunner(
             #     stream.
             # Without clones, the copy stream would read torn data.
             routed_experts_snapshot = None
+            routed_experts_cpu_buffer = None
             if self.routed_experts_initialized:
                 buf = self.routed_experts_capturer.get_device_buffer()
                 total = scheduler_output.total_num_scheduled_tokens
@@ -4563,6 +4710,9 @@ class GPUModelRunner(
                     slot_mapping=self.routed_experts_slot_mapping_device[
                         :total
                     ].clone(),
+                )
+                routed_experts_cpu_buffer = (
+                    self._next_routed_experts_async_cpu_buffer()
                 )
 
             async_output = AsyncGPUModelRunnerOutput(
@@ -4573,6 +4723,7 @@ class GPUModelRunner(
                 async_output_copy_stream=self._get_or_create_async_output_copy_stream(),
                 vocab_size=self.input_batch.vocab_size,
                 routed_experts=routed_experts_snapshot,
+                routed_experts_cpu_buffer=routed_experts_cpu_buffer,
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
@@ -5053,9 +5204,23 @@ class GPUModelRunner(
                     vllm_config=self.vllm_config, model_config=self.model_config
                 )
                 if self.lora_config:
+                    self.model = load_and_attach_int4_shadow_model(
+                        self.model, self.vllm_config
+                    )
+                    int4_shadow_model = getattr(
+                        self.model, DUAL_PRECISION_SHADOW_MODEL_REF_ATTR, None
+                    )
+                if self.lora_config:
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
+                    if int4_shadow_model is not None:
+                        object.__setattr__(
+                            self.model,
+                            DUAL_PRECISION_SHADOW_MODEL_REF_ATTR,
+                            int4_shadow_model,
+                        )
+                    register_int4_shadow_model(self.model)
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
                     if hasattr(self.drafter, "load_model"):
@@ -5553,6 +5718,7 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        base_precision: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5675,6 +5841,8 @@ class GPUModelRunner(
                 f"Cudagraph runtime mode mismatch in dummy_run. "
                 f"Expected {_cudagraph_mode}, but got {cudagraph_runtime_mode}."
             )
+        if base_precision is not None:
+            batch_desc = replace(batch_desc, base_precision=base_precision)
 
         num_tokens_padded = batch_desc.num_tokens
         num_reqs_padded = (
@@ -5811,6 +5979,12 @@ class GPUModelRunner(
                 num_tokens_padded = ubatch_slices_padded[0].num_tokens
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_padded
+
+            bind_dual_precision_lora_base_layer(
+                self.model,
+                batch_desc.base_precision,
+                self.compilation_config.static_forward_context,
+            )
 
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
@@ -6486,6 +6660,7 @@ class GPUModelRunner(
                 remove_lora=False,
                 num_active_loras=desc.num_active_loras,
                 profile_seq_lens=profile_seq_lens,
+                base_precision=desc.base_precision,
             )
         self._dummy_run(
             desc.num_tokens,
@@ -6497,6 +6672,7 @@ class GPUModelRunner(
             num_active_loras=desc.num_active_loras,
             is_graph_capturing=True,
             profile_seq_lens=profile_seq_lens,
+            base_precision=desc.base_precision,
         )
 
     def _capture_cudagraphs(
@@ -7259,6 +7435,30 @@ class GPUModelRunner(
             device="cpu",
             pin_memory=self.pin_memory,
         )
+        async_ring_size = (
+            2
+            if self.use_async_scheduling
+            and self.parallel_config.pipeline_parallel_size <= 1
+            else max(1, self.parallel_config.pipeline_parallel_size)
+        )
+        self.routed_experts_async_cpu_ring = [
+            RoutedExpertsTensors(
+                routing_data=torch.empty(
+                    self.routed_experts_capturer.device_buffer.shape,
+                    dtype=self.routed_experts_capturer.device_buffer.dtype,
+                    device="cpu",
+                    pin_memory=self.pin_memory,
+                ),
+                slot_mapping=torch.empty(
+                    (max_tokens,),
+                    dtype=torch.int64,
+                    device="cpu",
+                    pin_memory=self.pin_memory,
+                ),
+            )
+            for _ in range(async_ring_size)
+        ]
+        self.routed_experts_async_cpu_ring_index = 0
         # Private device buffer so the shared ``block_table.slot_mapping``
         # can be overwritten by the next ``_prepare_inputs`` while the
         # D2H is still pending on the copy stream. Written in
@@ -7270,6 +7470,12 @@ class GPUModelRunner(
             device=self.device,
         )
         self.routed_experts_initialized = True
+
+    def _next_routed_experts_async_cpu_buffer(self) -> RoutedExpertsTensors:
+        ring = self.routed_experts_async_cpu_ring
+        index = self.routed_experts_async_cpu_ring_index
+        self.routed_experts_async_cpu_ring_index = (index + 1) % len(ring)
+        return ring[index]
 
     def _bind_routed_experts_capturer(self, capturer: RoutedExpertsCapturer) -> None:
         from vllm.model_executor.layers.fused_moe.layer import FusedMoE

@@ -8,6 +8,7 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.lora.utils import get_captured_lora_counts
+from vllm.model_executor.dual_precision import select_base_precision
 
 logger = init_logger(__name__)
 
@@ -157,6 +158,21 @@ class CudagraphDispatcher:
             uniform=uniform_decode,
             has_lora=has_lora,
             num_active_loras=num_active_loras,
+            base_precision=select_base_precision(num_reqs, has_lora),
+        )
+
+    def _create_eager_batch_descriptor(
+        self,
+        num_tokens: int,
+        has_lora: bool,
+    ) -> BatchDescriptor:
+        max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+        num_reqs = min(num_tokens, max_num_seqs)
+        return BatchDescriptor(
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            has_lora=has_lora,
+            base_precision=select_base_precision(num_reqs, has_lora),
         )
 
     def add_cudagraph_key(
@@ -282,7 +298,9 @@ class CudagraphDispatcher:
             or num_tokens > max_size
             or allowed_modes <= {CUDAGraphMode.NONE}
         ):
-            return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
+            return CUDAGraphMode.NONE, self._create_eager_batch_descriptor(
+                num_tokens, has_lora
+            )
 
         effective_num_active_loras = num_active_loras
         if has_lora and num_active_loras > 0:
@@ -325,7 +343,9 @@ class CudagraphDispatcher:
             f"No matching cudagraph found and NONE is not in "
             f"allowed_modes={allowed_modes}"
         )
-        return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
+        return CUDAGraphMode.NONE, self._create_eager_batch_descriptor(
+            num_tokens, has_lora
+        )
 
     def get_capture_descs(self) -> list[tuple[CUDAGraphMode, list[BatchDescriptor]]]:
         """

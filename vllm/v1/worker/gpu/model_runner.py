@@ -38,6 +38,12 @@ from vllm.distributed.parallel_state import (
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping
+from vllm.model_executor.dual_precision import (
+    DUAL_PRECISION_SHADOW_MODEL_REF_ATTR,
+    bind_dual_precision_lora_base_layer,
+    load_and_attach_int4_shadow_model,
+    register_int4_shadow_model,
+)
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -277,9 +283,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 vllm_config=self.vllm_config, model_config=self.vllm_config.model_config
             )
             if self.lora_config:
+                self.model = load_and_attach_int4_shadow_model(
+                    self.model, self.vllm_config
+                )
+                int4_shadow_model = getattr(
+                    self.model, DUAL_PRECISION_SHADOW_MODEL_REF_ATTR, None
+                )
+            if self.lora_config:
                 self.model = self.load_lora_model(
                     self.model, self.vllm_config, self.device
                 )
+                if int4_shadow_model is not None:
+                    object.__setattr__(
+                        self.model,
+                        DUAL_PRECISION_SHADOW_MODEL_REF_ATTR,
+                        int4_shadow_model,
+                    )
+                register_int4_shadow_model(self.model)
 
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None
@@ -1046,6 +1066,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_size,
             self.dp_rank,
             need_eager=is_profile or skip_compiled,
+            has_lora=self.lora_config is not None,
         )
 
         if batch_desc.num_tokens == 0:
@@ -1164,6 +1185,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             del intermediate_tensors
 
         # Run model.
+        bind_dual_precision_lora_base_layer(
+            self.model,
+            batch_desc.base_precision,
+            self.vllm_config.compilation_config.static_forward_context,
+        )
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
@@ -1175,7 +1201,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
                 num_tokens=input_batch.num_tokens_after_padding,
+                num_reqs=input_batch.num_reqs_after_padding,
+                uniform=batch_desc.uniform_token_count is not None,
                 has_lora=self.lora_config is not None,
+                base_precision=batch_desc.base_precision,
             )
 
             with set_forward_context(

@@ -14,6 +14,9 @@ from vllm.forward_context import (
     get_forward_context,
     is_forward_context_available,
 )
+from vllm.model_executor.dual_precision import (
+    register_dual_precision_lora_layer,
+)
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
@@ -21,7 +24,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.platforms import current_platform
-from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+from vllm.utils.multi_stream_utils import execute_in_parallel, maybe_execute_in_parallel
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .base import BaseLayerWithLoRA
@@ -72,6 +75,7 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
 
         self._enable_aux_cuda_stream = envs.VLLM_LORA_ENABLE_DUAL_STREAM
         self.base_layer = base_layer
+        register_dual_precision_lora_layer(self, base_layer)
         self.input_size = self.base_layer.input_size
         # Ensure tp_size and tp_rank consistency with the base_layer.
         self.tp_size = self.base_layer.tp_size
@@ -81,6 +85,8 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         self.output_slices: tuple[int, ...]
         self.output_size: int
         self.n_slices: int
+        self.rollout_lora_a_stacked: torch.Tensor | None = None
+        self.rollout_lora_b_stacked: torch.Tensor | None = None
 
     def _init_lora_stream_context(self) -> None:
         if not self._enable_aux_cuda_stream:
@@ -148,11 +154,74 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
             for _ in range(self.n_slices)
         )
         self.output_slices = (self.lora_b_stacked[0].shape[2],)
+        self._create_rollout_lora_weights(max_loras)
+
+    def _create_rollout_lora_weights(self, max_loras: int) -> None:
+        if not envs.ROLLOUT_QLORA:
+            self.rollout_lora_a_stacked = None
+            self.rollout_lora_b_stacked = None
+            return
+
+        total_rank = sum(weight.shape[2] for weight in self.lora_a_stacked)
+        total_output = sum(self.output_slices)
+        self.rollout_lora_a_stacked = torch.zeros(
+            max_loras,
+            1,
+            total_rank,
+            self.input_size,
+            dtype=self.lora_config.lora_dtype,
+            device=self.device,
+        )
+        self.rollout_lora_b_stacked = torch.zeros(
+            max_loras,
+            1,
+            total_output,
+            total_rank,
+            dtype=self.lora_config.lora_dtype,
+            device=self.device,
+        )
+
+    def _refresh_rollout_lora_weights(self, index: int) -> None:
+        if self.rollout_lora_a_stacked is None or self.rollout_lora_b_stacked is None:
+            return
+
+        self.rollout_lora_a_stacked[index].zero_()
+        self.rollout_lora_b_stacked[index].zero_()
+
+        rank_offset = 0
+        output_offset = 0
+        for slice_idx, output_size in enumerate(self.output_slices):
+            lora_a = self.lora_a_stacked[slice_idx][index, 0]
+            lora_b = self.lora_b_stacked[slice_idx][index, 0]
+            rank = lora_a.shape[0]
+
+            self.rollout_lora_a_stacked[
+                index, 0, rank_offset : rank_offset + rank, :
+            ].copy_(lora_a, non_blocking=True)
+            self.rollout_lora_b_stacked[
+                index,
+                0,
+                output_offset : output_offset + output_size,
+                rank_offset : rank_offset + rank,
+            ].copy_(lora_b[:output_size, :rank], non_blocking=True)
+
+            rank_offset += rank
+            output_offset += output_size
+
+    def _rollout_lora_kwargs(self) -> dict[str, torch.Tensor | None]:
+        return {
+            "rollout_lora_a_stacked": self.rollout_lora_a_stacked,
+            "rollout_lora_b_stacked": self.rollout_lora_b_stacked,
+        }
 
     def reset_lora(self, index: int):
         for s_index in range(self.n_slices):
             self.lora_a_stacked[s_index][index] = 0
             self.lora_b_stacked[s_index][index] = 0
+        if self.rollout_lora_a_stacked is not None:
+            self.rollout_lora_a_stacked[index] = 0
+        if self.rollout_lora_b_stacked is not None:
+            self.rollout_lora_b_stacked[index] = 0
 
     def set_lora(
         self,
@@ -181,6 +250,7 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         self.lora_b_stacked[0][index, 0, : lora_b.shape[0], : lora_b.shape[1]].copy_(
             lora_b, non_blocking=True
         )
+        self._refresh_rollout_lora_weights(index)
 
     def apply(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         # is_forward_context_available for tower modules
@@ -199,6 +269,12 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         return self._apply_lora_to_output(x, output)
 
     def _apply_base_forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            envs.ROLLOUT_QLORA
+            and self._enable_aux_cuda_stream
+            and is_forward_context_available()
+        ):
+            return self._apply_base_forward_async(x)
         base_output = self.base_layer(x)
         output = base_output[0] if isinstance(base_output, tuple) else base_output
         return self._apply_lora_to_output(x, output)
@@ -216,7 +292,13 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
             x = x.flatten(0, 1)
 
         lora_output: torch.Tensor | None = self.punica_wrapper.add_lora_linear(
-            output, x, self.lora_a_stacked, self.lora_b_stacked, 1.0, self.output_slices
+            output,
+            x,
+            self.lora_a_stacked,
+            self.lora_b_stacked,
+            1.0,
+            self.output_slices,
+            **self._rollout_lora_kwargs(),
         )
         if not current_platform.can_update_inplace():
             output = lora_output
@@ -227,6 +309,29 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
             output = output.reshape(original_shape)
 
         return output
+
+    def _execute_lora_async(
+        self,
+        base_fn,
+        lora_fn,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if envs.ROLLOUT_QLORA:
+            output, aux_results = execute_in_parallel(
+                base_fn,
+                [lora_fn],
+                self._events[0],
+                [self._events[1]],
+                [self._lora_stream],
+                enable=True,
+            )
+            return output, aux_results[0]
+        return maybe_execute_in_parallel(
+            base_fn,
+            lora_fn,
+            self._events[0],
+            self._events[1],
+            self._lora_stream,
+        )
 
     def _apply_async_impl(
         self, x: torch.Tensor, bias: torch.Tensor | None = None
@@ -265,16 +370,11 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
                 1.0,
                 self.output_slices,
                 add_inputs=False,
+                **self._rollout_lora_kwargs(),
             )
             return lora_output
 
-        output, lora_result = maybe_execute_in_parallel(
-            base_fn,
-            lora_fn,
-            self._events[0],
-            self._events[1],
-            self._lora_stream,
-        )
+        output, lora_result = self._execute_lora_async(base_fn, lora_fn)
 
         original_shape = output.shape if output.ndim == 3 else None
 
@@ -292,6 +392,45 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         if original_shape is not None:
             output = output.reshape(original_shape)
 
+        return output
+
+    def _apply_base_forward_async(self, x: torch.Tensor) -> torch.Tensor:
+        assert envs.VLLM_LORA_ENABLE_DUAL_STREAM
+        assert x.ndim in (2, 3)
+        num_tokens = x.size(0) if x.ndim == 2 else x.size(1)
+        output_size = sum(self.output_slices)
+
+        def base_fn() -> torch.Tensor:
+            base_output = self.base_layer(x)
+            return base_output[0] if isinstance(base_output, tuple) else base_output
+
+        def lora_fn() -> torch.Tensor:
+            lora_output = torch.zeros(
+                (num_tokens, output_size),
+                device=self.device,
+                dtype=x.dtype,
+            )
+            x_2d = x.flatten(0, 1) if x.ndim == 3 else x
+            self.punica_wrapper.add_lora_linear(
+                lora_output,
+                x_2d,
+                self.lora_a_stacked,
+                self.lora_b_stacked,
+                1.0,
+                self.output_slices,
+                add_inputs=False,
+                **self._rollout_lora_kwargs(),
+            )
+            return lora_output
+
+        output, lora_result = self._execute_lora_async(base_fn, lora_fn)
+
+        original_shape = output.shape if output.ndim == 3 else None
+        if x.ndim == 3 and output.ndim == 3:
+            output = output.flatten(0, 1)
+        output.add_(lora_result)
+        if original_shape is not None:
+            output = output.reshape(original_shape)
         return output
 
     @property

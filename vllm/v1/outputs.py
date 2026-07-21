@@ -148,6 +148,22 @@ class RoutedExpertsTensors(NamedTuple):
             self.slot_mapping.to("cpu", non_blocking=True),
         )
 
+    def copy_to_cpu_nonblocking(
+        self, cpu_buffer: "RoutedExpertsTensors | None"
+    ) -> "RoutedExpertsTensors":
+        """Issue non-blocking D2H into a pre-allocated pinned CPU buffer."""
+        if self.routing_data.device.type == "cpu":
+            return self
+        if cpu_buffer is None:
+            return self.to_cpu_nonblocking()
+
+        num_tokens = self.routing_data.shape[0]
+        routing_data_cpu = cpu_buffer.routing_data[:num_tokens]
+        slot_mapping_cpu = cpu_buffer.slot_mapping[:num_tokens]
+        routing_data_cpu.copy_(self.routing_data, non_blocking=True)
+        slot_mapping_cpu.copy_(self.slot_mapping, non_blocking=True)
+        return RoutedExpertsTensors(routing_data_cpu, slot_mapping_cpu)
+
     def tolists(self) -> "RoutedExpertsLists":
         """Convert to the numpy-backed form consumed by the scheduler.
 

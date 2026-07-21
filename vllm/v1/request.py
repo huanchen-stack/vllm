@@ -166,6 +166,16 @@ class Request:
         # The number of times this request has been preempted by the scheduler.
         self.num_preemptions = 0
 
+        # Dual precision rollout can force a one-time internal preemption to
+        # recompute this request's KV under the INT4 base path after the live
+        # request count crosses the precision threshold.
+        self.dual_precision_reprefill_done = False
+        # Number of visible generated tokens that existed at the dual-precision
+        # re-prefill boundary. If a downstream state rebuild folds those tokens
+        # into the prompt side, this offset preserves the original max_tokens
+        # budget instead of granting a fresh post-reprefill generation cap.
+        self.dual_precision_reprefill_output_offset = 0
+
         self.prefill_stats: PrefillStats | None = PrefillStats()
 
         self.block_hashes: list[BlockHash] = []
@@ -246,6 +256,14 @@ class Request:
     @property
     def num_output_tokens(self) -> int:
         return len(self._output_token_ids)
+
+    @property
+    def num_visible_output_tokens(self) -> int:
+        """Visible output length, preserving output folded into re-prefill."""
+        offset = self.dual_precision_reprefill_output_offset
+        if offset and self.num_output_tokens < offset:
+            return offset + self.num_output_tokens
+        return self.num_output_tokens
 
     @property
     def num_encoder_inputs(self) -> int:

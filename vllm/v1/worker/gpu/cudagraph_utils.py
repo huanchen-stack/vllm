@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, NamedTuple
 
 import torch
@@ -23,6 +23,10 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.dual_precision import (
+    bind_dual_precision_lora_base_layer,
+    select_base_precision,
+)
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -51,6 +55,8 @@ class BatchExecutionDescriptor:
     num_tokens: int
     num_reqs: int | None  # None means no request padding is needed (PIECEWISE graphs)
     uniform_token_count: int | None = None
+    has_lora: bool = False
+    base_precision: str = "bf16"
 
 
 def _is_compatible(
@@ -114,6 +120,7 @@ class CudaGraphManager:
         self._graphs_captured = False
         self._candidates: list[list[BatchExecutionDescriptor]] = []
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
+        self.has_lora = False
         # adjust the cudagraph sizes to be a multiple of the uniform decode query length
         self.compilation_config.adjust_cudagraph_sizes_for_spec_decode(
             self.decode_query_len, self.tp_size
@@ -203,6 +210,7 @@ class CudaGraphManager:
             tuple[Callable[[CUDAGraphMode], None], CapturedAttentionState],
         ],
         progress_bar_desc: str = "Capturing CUDA graphs",
+        has_lora: bool = False,
     ) -> dict[BatchExecutionDescriptor, CapturedAttentionState]:
         """Capture CUDA graphs.
 
@@ -213,6 +221,7 @@ class CudaGraphManager:
         captured_attn_states: dict[
             BatchExecutionDescriptor, CapturedAttentionState
         ] = {}
+        self.has_lora = has_lora
         with graph_capture(device=self.device):
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
@@ -222,6 +231,17 @@ class CudaGraphManager:
                     continue
 
                 descs = self._capture_descs[mode]
+                descs = [
+                    replace(
+                        desc,
+                        has_lora=has_lora,
+                        base_precision=select_base_precision(
+                            desc.num_reqs or min(desc.num_tokens, self.max_num_reqs),
+                            has_lora,
+                        ),
+                    )
+                    for desc in descs
+                ]
                 if is_global_first_rank():
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
                 for desc in descs:
@@ -274,9 +294,22 @@ class CudaGraphManager:
         if self._graphs_captured and 0 < num_tokens < len(self._candidates):
             for desc in self._candidates[num_tokens]:
                 if _is_compatible(desc, num_reqs, num_tokens, uniform_token_count):
-                    return desc
+                    num_reqs_for_precision = desc.num_reqs or min(
+                        desc.num_tokens, self.max_num_reqs
+                    )
+                    return replace(
+                        desc,
+                        has_lora=self.has_lora,
+                        base_precision=select_base_precision(
+                            num_reqs_for_precision, self.has_lora
+                        ),
+                    )
         return BatchExecutionDescriptor(
-            cg_mode=CUDAGraphMode.NONE, num_tokens=num_tokens, num_reqs=num_reqs
+            cg_mode=CUDAGraphMode.NONE,
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            has_lora=self.has_lora,
+            base_precision=select_base_precision(num_reqs, self.has_lora),
         )
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor):
@@ -352,6 +385,11 @@ class ModelCudaGraphManager(CudaGraphManager):
         ]:
             num_tokens = desc.num_tokens
             num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
+            bind_dual_precision_lora_base_layer(
+                model,
+                desc.base_precision,
+                self.vllm_config.compilation_config.static_forward_context,
+            )
             num_tokens_across_dp = (
                 torch.full((self.dp_size,), num_tokens, dtype=torch.int32, device="cpu")
                 if self.dp_size > 1
@@ -382,12 +420,15 @@ class ModelCudaGraphManager(CudaGraphManager):
             )
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
-                batch_descriptor = None
                 if cg_mode == CUDAGraphMode.PIECEWISE:
                     assert attn_metadata is None
-                    batch_descriptor = BatchDescriptor(
-                        num_tokens=num_tokens, has_lora=has_lora
-                    )
+                batch_descriptor = BatchDescriptor(
+                    num_tokens=num_tokens,
+                    num_reqs=num_reqs,
+                    uniform=desc.uniform_token_count is not None,
+                    has_lora=has_lora,
+                    base_precision=desc.base_precision,
+                )
                 with set_forward_context(
                     attn_metadata,
                     self.vllm_config,
@@ -438,7 +479,7 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             return forward_fn, CapturedAttentionState(attn_metadata, slot_mappings)
 
-        return super().capture(create_forward_fn, progress_bar_desc)
+        return super().capture(create_forward_fn, progress_bar_desc, has_lora)
 
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor

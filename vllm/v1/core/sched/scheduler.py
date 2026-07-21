@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -98,6 +99,16 @@ class Scheduler(SchedulerInterface):
             defaultdict(set) if include_finished_set else None
         )
         self.prev_step_scheduled_req_ids: set[str] = set()
+        self.dual_precision_reprefill_enabled = (
+            envs.VLLM_DUAL_PRECISION_REPREFILL
+            and envs.ROLLOUT_QLORA
+            and (
+                envs.VLLM_DUAL_PRECISION_ROLLOUT
+                or envs.VLLM_REPREFILL_ONLY_ROLLOUT
+            )
+        )
+        self.dual_precision_reprefill_armed = False
+        self.dual_precision_reprefill_triggered = False
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -133,6 +144,11 @@ class Scheduler(SchedulerInterface):
                 self.vllm_config.kv_transfer_config.kv_load_failure_policy
             )
             self.recompute_kv_load_failures = kv_load_failure_policy == "recompute"
+            if self.dual_precision_reprefill_enabled:
+                raise ValueError(
+                    "VLLM_DUAL_PRECISION_REPREFILL does not support KV "
+                    "connectors yet."
+                )
 
         self.kv_event_publisher = EventPublisherFactory.create(
             self.kv_events_config,
@@ -142,6 +158,21 @@ class Scheduler(SchedulerInterface):
         if self.vllm_config.ec_transfer_config is not None:
             self.ec_connector = ECConnectorFactory.create_connector(
                 config=self.vllm_config, role=ECConnectorRole.SCHEDULER
+            )
+            if self.dual_precision_reprefill_enabled:
+                raise ValueError(
+                    "VLLM_DUAL_PRECISION_REPREFILL does not support EC "
+                    "connectors yet."
+                )
+
+        if (
+            self.dual_precision_reprefill_enabled
+            and self.cache_config.enable_prefix_caching
+        ):
+            raise ValueError(
+                "VLLM_DUAL_PRECISION_REPREFILL requires prefix caching to be "
+                "disabled because cache block hashes do not encode base "
+                "precision."
             )
 
         num_gpu_blocks = self.cache_config.num_gpu_blocks
@@ -365,6 +396,10 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+
+        preempted_reqs.extend(
+            self._maybe_trigger_dual_precision_reprefill(scheduled_timestamp)
+        )
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -953,6 +988,77 @@ class Scheduler(SchedulerInterface):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
+
+    def _maybe_trigger_dual_precision_reprefill(
+        self,
+        timestamp: float,
+    ) -> list[Request]:
+        if not self.dual_precision_reprefill_enabled:
+            return []
+
+        threshold = envs.VLLM_DUAL_PRECISION_THRESHOLD
+        if threshold < 0 or self.dual_precision_reprefill_triggered:
+            return []
+
+        unfinished = self.get_num_unfinished_requests()
+        if unfinished > threshold:
+            self.dual_precision_reprefill_armed = True
+            return []
+        if not self.dual_precision_reprefill_armed or unfinished == 0:
+            return []
+
+        self.dual_precision_reprefill_triggered = True
+        preempted: list[Request] = []
+        total_reprefill_tokens = 0
+
+        # Preempt in reverse order so FCFS waiting order is preserved after
+        # _preempt_request() prepends each request.
+        running_reqs = self.running
+        self.running = []
+        for request in reversed(running_reqs):
+            if request.dual_precision_reprefill_done:
+                self.running.insert(0, request)
+                continue
+            request.dual_precision_reprefill_done = True
+            if request.num_computed_tokens == 0:
+                self.running.insert(0, request)
+                continue
+
+            generated_tokens = request.num_output_tokens
+            request.dual_precision_reprefill_output_offset = max(
+                request.dual_precision_reprefill_output_offset,
+                generated_tokens,
+            )
+            total_tokens = request.num_tokens
+            total_reprefill_tokens += total_tokens
+            self._preempt_request(request, timestamp)
+            if request.num_output_placeholders:
+                request.async_tokens_to_discard = request.num_output_placeholders
+                request.num_output_placeholders = 0
+            preempted.append(request)
+            logger.info(
+                "Dual precision re-prefill request %s: generated_tokens=%d, "
+                "total_reprefill_tokens=%d",
+                request.request_id,
+                generated_tokens,
+                total_tokens,
+            )
+
+        for request in itertools.chain(self.waiting, self.skipped_waiting):
+            request.dual_precision_reprefill_done = True
+
+        if preempted:
+            self.prev_step_scheduled_req_ids.clear()
+        logger.info(
+            "Dual precision re-prefill triggered: threshold=%d, "
+            "unfinished_requests=%d, preempted_requests=%d, "
+            "total_reprefill_tokens=%d",
+            threshold,
+            unfinished,
+            len(preempted),
+            total_reprefill_tokens,
+        )
+        return preempted
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER

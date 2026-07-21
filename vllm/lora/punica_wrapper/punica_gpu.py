@@ -11,7 +11,10 @@ from typing import final
 
 import torch
 
+from vllm import envs
+from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping
+from vllm.lora.ops.torch_ops.rollout_lora_ops import rollout_lora_matmul
 from vllm.lora.utils import get_captured_lora_counts
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.utils.math_utils import round_up
@@ -27,6 +30,10 @@ if HAS_TRITON:
 from vllm import _custom_ops as ops
 
 from .punica_base import PunicaWrapperBase
+
+logger = init_logger(__name__)
+_ROLLOUT_LORA_FASTPATH_LOGGED = False
+_ROLLOUT_LORA_FALLBACK_LOGGED = False
 
 
 @final
@@ -48,6 +55,10 @@ class PunicaWrapperGPU(PunicaWrapperBase):
 
         self.lora_config = kwargs["lora_config"]
         self.max_loras = self.lora_config.max_loras
+        self._rollout_single_lora_index: int | None = None
+        self._rollout_lora_metadata_debug: str = ""
+        self._rollout_can_skip_punica_metadata = False
+        self._punica_metadata_prepared = False
 
         # Compute captured LoRA counts for cudagraph specialization.
         captured_lora_counts = get_captured_lora_counts(
@@ -82,10 +93,139 @@ class PunicaWrapperGPU(PunicaWrapperBase):
     ):
         self.is_prefill = mapping.is_prefill
         self._update_base_metadata(mapping, lora_index_to_id, max_loras, vocab_size)
+        unique_mapping_ids = sorted(set(mapping.index_mapping))
+        self._rollout_lora_metadata_debug = (
+            f"mapping_len={len(mapping.index_mapping)}, "
+            f"mapping_head={mapping.index_mapping[:8]}, "
+            f"unique_ids={unique_mapping_ids[:8]}, "
+            f"runtime_max_loras={max_loras}, "
+            f"config_max_loras={self.max_loras}, "
+            f"lora_index_to_id={lora_index_to_id}"
+        )
+        self._rollout_single_lora_index = self._get_rollout_single_lora_index(
+            mapping, lora_index_to_id, max_loras
+        )
+        self._punica_metadata_prepared = False
+        self._rollout_can_skip_punica_metadata = (
+            envs.ROLLOUT_QLORA
+            and not self.lora_config.fully_sharded_loras
+            and self._rollout_single_lora_index is not None
+        )
 
-        # Prepare cuda kernel metadata tensors
+        if not self._rollout_can_skip_punica_metadata:
+            self._prepare_punica_metadata()
+
+    def _prepare_punica_metadata(self) -> None:
+        if self._punica_metadata_prepared:
+            return
         self.token_mapping_meta.prepare_tensors(self.token_lora_indices)
         self.prompt_mapping_meta.prepare_tensors(self.sampler_indices)
+        self._punica_metadata_prepared = True
+
+    def _ensure_punica_metadata_prepared(self) -> None:
+        if not self._punica_metadata_prepared:
+            self._prepare_punica_metadata()
+
+    def _get_rollout_single_lora_index(
+        self,
+        mapping: LoRAMapping,
+        lora_index_to_id: list[int | None],
+        max_loras: int,
+    ) -> int | None:
+        if not mapping.index_mapping:
+            return 0 if envs.ROLLOUT_QLORA and max_loras == 1 else None
+
+        positive_lora_ids = {
+            lora_id for lora_id in mapping.index_mapping if lora_id > 0
+        }
+        if len(positive_lora_ids) > 1:
+            return None
+        if len(positive_lora_ids) == 1:
+            first_lora_id = next(iter(positive_lora_ids))
+            try:
+                return lora_index_to_id.index(first_lora_id)
+            except ValueError:
+                return None
+        if envs.ROLLOUT_QLORA and max_loras == 1:
+            return 0
+        if envs.ROLLOUT_QLORA and self.max_loras == 1:
+            return 0
+
+        try:
+            return next(i for i, lora_id in enumerate(lora_index_to_id) if lora_id)
+        except ValueError:
+            return None
+        except StopIteration:
+            return None
+
+    def _try_add_rollout_lora_linear(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        scale: float,
+        add_inputs: bool,
+        rollout_lora_a_stacked: torch.Tensor | None,
+        rollout_lora_b_stacked: torch.Tensor | None,
+    ) -> bool:
+        global _ROLLOUT_LORA_FASTPATH_LOGGED
+        global _ROLLOUT_LORA_FALLBACK_LOGGED
+
+        if (
+            not envs.ROLLOUT_QLORA
+            or self.lora_config.fully_sharded_loras
+            or rollout_lora_a_stacked is None
+            or rollout_lora_b_stacked is None
+            or self._rollout_single_lora_index is None
+        ):
+            if (
+                envs.ROLLOUT_QLORA
+                and not _ROLLOUT_LORA_FALLBACK_LOGGED
+                and not torch.compiler.is_compiling()
+            ):
+                logger.warning(
+                    "Rollout QLoRA fast path fallback: fully_sharded=%s, "
+                    "has_rollout_a=%s, has_rollout_b=%s, single_lora_index=%s, "
+                    "%s.",
+                    self.lora_config.fully_sharded_loras,
+                    rollout_lora_a_stacked is not None,
+                    rollout_lora_b_stacked is not None,
+                    self._rollout_single_lora_index,
+                    self._rollout_lora_metadata_debug,
+                )
+                _ROLLOUT_LORA_FALLBACK_LOGGED = True
+            return False
+
+        x = x.view(-1, x.shape[-1])
+        y = y.view(-1, y.shape[-1])
+        lora_index = self._rollout_single_lora_index
+        if (
+            not _ROLLOUT_LORA_FASTPATH_LOGGED
+            and not torch.compiler.is_compiling()
+        ):
+            logger.warning(
+                "Rollout QLoRA fast path active: lora_index=%s, "
+                "tokens=%s, hidden=%s, output=%s.",
+                lora_index,
+                x.shape[0],
+                x.shape[-1],
+                y.shape[-1],
+            )
+            _ROLLOUT_LORA_FASTPATH_LOGGED = True
+        lora_a = rollout_lora_a_stacked[lora_index, 0]
+        lora_b = rollout_lora_b_stacked[lora_index, 0]
+        lora_output = rollout_lora_matmul(
+            x,
+            lora_a,
+            lora_b,
+            y.shape[-1],
+            scale,
+        ).to(dtype=y.dtype)
+        lora_output = lora_output[:, : y.shape[-1]]
+        if add_inputs:
+            y.add_(lora_output)
+        else:
+            y.copy_(lora_output)
+        return True
 
     def add_shrink(
         self,
@@ -110,6 +250,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         """
 
         x = x.view(-1, x.shape[-1])
+        self._ensure_punica_metadata_prepared()
         lora_shrink(
             x,
             lora_a_stacked,
@@ -150,6 +291,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         """
         y_org = y
         y = y.view(-1, y.shape[-1])
+        self._ensure_punica_metadata_prepared()
 
         assert x.ndim == 3
         assert x.size(0) == len(output_slices)
@@ -189,6 +331,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             add_inputs (bool): Default to True.
         """
 
+        self._ensure_punica_metadata_prepared()
         lora_expand(
             x.unsqueeze(dim=0),
             (lora_b_stacked,),
@@ -239,6 +382,18 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             "To minimize overhead, the buffer should be created by "
             ".add_lora_linear() instead of being passed in."
         )
+        add_inputs = kwargs.pop("add_inputs", True)
+        if self._try_add_rollout_lora_linear(
+            y,
+            x,
+            scale,
+            add_inputs,
+            kwargs.pop("rollout_lora_a_stacked", None),
+            kwargs.pop("rollout_lora_b_stacked", None),
+        ):
+            return
+
+        self._ensure_punica_metadata_prepared()
         r = lora_b_stacked[0].size(-1)
         # We set the buffer to be float32 by default, refer to:
         # https://github.com/triton-lang/triton/issues/1387
@@ -246,7 +401,6 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         buffer = torch.empty(
             (len(output_slices), x.size(0), r), dtype=torch.float32, device=x.device
         )
-        add_inputs = kwargs.pop("add_inputs", True)
         self.add_shrink(
             buffer,  # type: ignore
             x,
@@ -292,6 +446,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         y_org = y
         y = y.view(-1, y.shape[-1])
         x = x.view(-1, x.shape[-1])
+        self._ensure_punica_metadata_prepared()
         r = lora_b_stacked.size(-1)
 
         assert buffer is None, (
@@ -345,6 +500,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         read from `self.token_mapping_meta`. This is how EP+LoRA injects the
         per-rank-local token→LoRA map after all-to-all dispatch.
         """
+        self._ensure_punica_metadata_prepared()
         (
             token_lora_mapping_meta,
             _,
@@ -440,6 +596,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         """
         Performs a fused forward computation for LoRA of Mixture-of-Experts (MoE) layer.
         """
+        self._ensure_punica_metadata_prepared()
         (
             token_lora_mapping_meta,
             _,

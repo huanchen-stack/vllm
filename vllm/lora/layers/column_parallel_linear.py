@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
+from vllm import envs
 from vllm.config.lora import LoRAConfig
 from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.distributed.utils import divide
@@ -38,6 +39,20 @@ def _mcp_apply(x, bias, layer: "ColumnParallelLinearWithLoRA"):
     x = x.view(-1, x.shape[-1])
     output, out_orig_shape = output.view(-1, output.shape[-1]), output.shape
 
+    if envs.ROLLOUT_QLORA and not layer.lora_config.fully_sharded_loras:
+        lora_output: torch.Tensor | None = layer.punica_wrapper.add_lora_linear(
+            output,
+            x,
+            layer.lora_a_stacked,
+            layer.lora_b_stacked,
+            1.0,
+            layer.output_slices,
+            **layer._rollout_lora_kwargs(),
+        )
+        if not current_platform.can_update_inplace():
+            output = lora_output
+        return output.view(*out_orig_shape)
+
     # Since communication is needed, the buffer is directly initialized as a
     # tensor rather than a tuple of tensor.
     local_lora_rank = layer.lora_a_stacked[0].shape[2]
@@ -69,7 +84,7 @@ def _mcp_apply(x, bias, layer: "ColumnParallelLinearWithLoRA"):
         layer.lora_b_stacked,
         layer.output_slices,
         offset_start=0,
-        add_input=True,
+        add_inputs=True,
     )
 
     if not current_platform.can_update_inplace():
@@ -242,6 +257,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             )
             for output_size in self.output_slices
         )
+        self._create_rollout_lora_weights(max_loras)
 
     def slice_lora_a(
         self, lora_a: list[torch.Tensor | None]
@@ -324,8 +340,12 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
                 self.lora_b_stacked[i][
                     index, 0, : lora_b_i.shape[0], : lora_b_i.shape[1]
                 ].copy_(lora_b_i, non_blocking=True)
+        self._refresh_rollout_lora_weights(index)
 
     def apply(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        if envs.ROLLOUT_QLORA and not self.lora_config.fully_sharded_loras:
+            return BaseLinearLayerWithLoRA.apply(self, x, bias)
+
         merged_cls = maybe_get_oot_by_class(MergedColumnParallelLinear)
         # Effectively unsharded subclasses can safely reuse their custom
         # forward() implementation before applying the LoRA delta.

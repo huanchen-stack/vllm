@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+import vllm.envs as envs
 from vllm.config import (
     CacheConfig,
     ECTransferConfig,
@@ -26,6 +27,7 @@ from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.utils import check_stop
 from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -72,6 +74,114 @@ def test_get_num_unfinished_requests():
     for i, request in enumerate(requests):
         scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_STOPPED)
         assert scheduler.get_num_unfinished_requests() == len(requests) - i - 1
+
+
+def test_dual_precision_reprefill_on_threshold_crossing(monkeypatch):
+    monkeypatch.setattr(envs, "ROLLOUT_QLORA", True)
+    monkeypatch.setattr(envs, "VLLM_DUAL_PRECISION_ROLLOUT", True)
+    monkeypatch.setattr(envs, "VLLM_DUAL_PRECISION_REPREFILL", True)
+    monkeypatch.setattr(envs, "VLLM_DUAL_PRECISION_THRESHOLD", 16)
+
+    scheduler = create_scheduler(max_num_seqs=17)
+    requests = create_requests(num_requests=17, num_tokens=10)
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert len(output.scheduled_new_reqs) == 17
+    assert output.preempted_req_ids == set()
+    assert scheduler.dual_precision_reprefill_armed
+    assert not scheduler.dual_precision_reprefill_triggered
+
+    for request in requests:
+        request.append_output_token_ids(123)
+        request.num_computed_tokens = request.num_tokens
+    scheduler.finish_requests("0", RequestStatus.FINISHED_ABORTED)
+
+    output = scheduler.schedule()
+    survivor_ids = {request.request_id for request in requests[1:]}
+    assert output.preempted_req_ids == survivor_ids
+    assert scheduler.dual_precision_reprefill_triggered
+    assert output.total_num_scheduled_tokens == 0
+    assert len(scheduler.running) == 0
+    assert len(scheduler.waiting) == 16
+
+    for request in requests[1:]:
+        assert request.dual_precision_reprefill_done
+        assert request.dual_precision_reprefill_output_offset == 1
+        assert request.status == RequestStatus.PREEMPTED
+        assert list(request.output_token_ids) == [123]
+        assert request.num_computed_tokens == 0
+        assert request.num_preemptions == 1
+
+    output = scheduler.schedule()
+    scheduled_ids = {req.req_id for req in output.scheduled_new_reqs}
+    scheduled_ids.update(output.scheduled_cached_reqs.req_ids)
+    assert scheduled_ids == survivor_ids
+    assert output.preempted_req_ids == set()
+    assert len(scheduler.running) == 16
+    assert len(scheduler.waiting) == 0
+
+    output = scheduler.schedule()
+    assert output.preempted_req_ids == set()
+
+
+def test_reprefill_only_on_threshold_crossing(monkeypatch):
+    monkeypatch.setattr(envs, "ROLLOUT_QLORA", True)
+    monkeypatch.setattr(envs, "VLLM_DUAL_PRECISION_ROLLOUT", False)
+    monkeypatch.setattr(envs, "VLLM_DUAL_PRECISION_REPREFILL", True)
+    monkeypatch.setattr(envs, "VLLM_REPREFILL_ONLY_ROLLOUT", True)
+    monkeypatch.setattr(envs, "VLLM_DUAL_PRECISION_THRESHOLD", 16)
+
+    scheduler = create_scheduler(max_num_seqs=17)
+    requests = create_requests(num_requests=17, num_tokens=10)
+    for request in requests:
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert len(output.scheduled_new_reqs) == 17
+    assert output.preempted_req_ids == set()
+    assert scheduler.dual_precision_reprefill_armed
+    assert not scheduler.dual_precision_reprefill_triggered
+
+    for request in requests:
+        request.append_output_token_ids(123)
+        request.num_computed_tokens = request.num_tokens
+    scheduler.finish_requests("0", RequestStatus.FINISHED_ABORTED)
+
+    output = scheduler.schedule()
+    survivor_ids = {request.request_id for request in requests[1:]}
+    assert output.preempted_req_ids == survivor_ids
+    assert scheduler.dual_precision_reprefill_triggered
+    assert len(scheduler.waiting) == 16
+
+
+def test_dual_precision_reprefill_rejects_prefix_cache(monkeypatch):
+    monkeypatch.setattr(envs, "ROLLOUT_QLORA", True)
+    monkeypatch.setattr(envs, "VLLM_DUAL_PRECISION_ROLLOUT", True)
+    monkeypatch.setattr(envs, "VLLM_DUAL_PRECISION_REPREFILL", True)
+
+    with pytest.raises(ValueError, match="requires prefix caching to be disabled"):
+        create_scheduler(enable_prefix_caching=True)
+
+
+def test_dual_precision_reprefill_preserves_visible_generation_cap():
+    request = create_requests(num_requests=1, max_tokens=4)[0]
+    request.append_output_token_ids([123, 124, 125])
+    request.dual_precision_reprefill_output_offset = request.num_output_tokens
+
+    assert request.num_visible_output_tokens == 3
+    assert not check_stop(request, max_model_len=100)
+
+    # Simulate a worker/scheduler state rebuild that folds the pre-switch
+    # generated tokens into the prompt side before continuing generation.
+    request._output_token_ids.clear()
+    request.append_output_token_ids(126)
+
+    assert request.num_output_tokens == 1
+    assert request.num_visible_output_tokens == 4
+    assert check_stop(request, max_model_len=100)
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
 
 
 @pytest.mark.parametrize(

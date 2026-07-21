@@ -7,6 +7,7 @@ import torch.distributed as dist
 
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_dp_group
+from vllm.model_executor.dual_precision import select_base_precision
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     CudaGraphManager,
@@ -49,10 +50,13 @@ def sync_cudagraph_and_dp_padding(
 
     # If any rank wants to run eager, all ranks run eager
     if synced_cg_mode == CUDAGraphMode.NONE:
+        has_lora = desired_batch_desc.has_lora
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
+            has_lora=has_lora,
+            base_precision=select_base_precision(num_reqs, has_lora),
         ), num_tokens_across_dp
 
     assert cudagraph_manager is not None, (
@@ -87,12 +91,15 @@ def dispatch_cg_and_sync_dp(
     dp_size: int,
     dp_rank: int,
     need_eager: bool = False,
+    has_lora: bool = False,
 ) -> tuple[BatchExecutionDescriptor, torch.Tensor | None]:
     if need_eager:
         batch_desc = BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
+            has_lora=has_lora,
+            base_precision=select_base_precision(num_reqs, has_lora),
         )
     else:
         assert cudagraph_manager is not None, (

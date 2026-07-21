@@ -56,6 +56,11 @@ class BatchDescriptor:
     (like fused_moe_lora) whose grid size depends on num_active_loras
     to be properly captured.
     """
+    base_precision: str = "bf16"
+    """
+    Base weight precision selected for LoRA rollout. Used by dual precision
+    QLoRA to switch only the base linear path while preserving LoRA kernels.
+    """
 
 
 def _compute_sp_num_tokens(
