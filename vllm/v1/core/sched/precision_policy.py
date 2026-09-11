@@ -300,7 +300,9 @@ class LookupTable:
         One prompt bucket and one live column: clamping maps every input to
         the single cell.  The frontier axis spans ``[scan, response_cap)``.
         """
-        count = max(1, (response_cap - scan_interval_tokens) // scan_interval_tokens)
+        count = max(
+            1, len(range(scan_interval_tokens, response_cap, scan_interval_tokens))
+        )
         return cls(
             frontier_start=scan_interval_tokens,
             frontier_step=scan_interval_tokens,
@@ -689,11 +691,12 @@ class CostModel:
 
     @property
     def frontier_count(self) -> int:
-        """Number of frontier bins ``scan, 2*scan, ..., < response_cap``."""
-        return max(
-            0,
-            (self.response_cap - self.scan_interval_tokens)
-            // self.scan_interval_tokens,
+        """Number of frontier bins ``scan, 2*scan, ..., < response_cap``
+        (``len(range(scan, cap, scan))``, as the archived builders)."""
+        return len(
+            range(
+                self.scan_interval_tokens, self.response_cap, self.scan_interval_tokens
+            )
         )
 
     def frontier_tokens(self, frontier_index: int) -> int:
@@ -965,9 +968,19 @@ def policy_from_json(raw: dict[str, Any], source: str = "") -> PrecisionPolicy:
             f"capture ceiling would run eager steps"
         )
 
+    calibration = raw.get("calibration") or {}
+    if not isinstance(calibration, dict):
+        raise ValueError(f"{label}: calibration must be an object")
+    kind_hint = calibration.get("kind")
+
     lookup_raw = raw.get("lookup_table")
     cost_raw = raw.get("cost_model")
-    if lookup_raw is None and cost_raw is None and fixed_switch_frontier is None:
+    if (
+        lookup_raw is None
+        and cost_raw is None
+        and fixed_switch_frontier is None
+        and kind_hint != KIND_UNIFORM_W4
+    ):
         raise ValueError(
             f"{label}: requires one of lookup_table, cost_model, or "
             "fixed_switch_frontier"
@@ -988,7 +1001,12 @@ def policy_from_json(raw: dict[str, Any], source: str = "") -> PrecisionPolicy:
                 f"{label}: lookup_table frontier_step ({table.frontier_step}) "
                 f"must equal scan_interval_tokens ({interval})"
             )
-        kind = KIND_LOOKUP
+        # A materialized inline baseline records its kind in calibration.
+        kind = (
+            kind_hint
+            if kind_hint in (KIND_FIXED_THRESHOLD, KIND_FIXED_FRONTIER)
+            else KIND_LOOKUP
+        )
     elif fixed_switch_frontier is not None:
         cap = _response_cap_hint(raw, fixed_switch_frontier)
         table = LookupTable.constant(
@@ -996,8 +1014,10 @@ def policy_from_json(raw: dict[str, Any], source: str = "") -> PrecisionPolicy:
         )
         kind = KIND_FIXED_FRONTIER
         receding = False
-    else:
+    elif cost_raw is not None:
         kind = KIND_COST_MODEL
+    else:
+        kind = KIND_UNIFORM_W4
 
     cost_model: CostModel | None = None
     if cost_raw is not None:
@@ -1011,9 +1031,6 @@ def policy_from_json(raw: dict[str, Any], source: str = "") -> PrecisionPolicy:
         except ValueError as error:
             raise ValueError(f"{label}: {error}") from error
 
-    calibration = raw.get("calibration") or {}
-    if not isinstance(calibration, dict):
-        raise ValueError(f"{label}: calibration must be an object")
     try:
         revision = int(calibration.get("policy_revision", 0))
     except (TypeError, ValueError) as error:
@@ -1178,6 +1195,7 @@ class PolicyDecider:
         self.switched = False
         self.commitment_armed = False
         self.observations = 0
+        self.peak_actual_live = 0
         self.reset()
 
     def reset(self) -> None:
@@ -1187,6 +1205,7 @@ class PolicyDecider:
         self.switched = self.policy.kind == KIND_UNIFORM_W4
         self.commitment_armed = False
         self.observations = 0
+        self.peak_actual_live = 0
 
     @property
     def base_precision(self) -> str:
@@ -1197,7 +1216,17 @@ class PolicyDecider:
         return self.policy.receding_horizon_lookup
 
     def guard_allows(self, actual_live: int) -> bool:
-        return actual_live <= self.policy.switch_live_cap
+        """Live-batch guard on the *actual* live count.
+
+        ``fixed_threshold`` additionally requires that the batch was
+        observed above the threshold first (the archived latch): while an
+        asynchronously admitted cohort is still arriving, a small live count
+        is not a drain.
+        """
+        cap = self.policy.switch_live_cap
+        if self.policy.kind == KIND_FIXED_THRESHOLD and self.peak_actual_live <= cap:
+            return False
+        return actual_live <= cap
 
     def quantize_frontier(self, tokens: int) -> int:
         step = self.policy.scan_interval_tokens
@@ -1219,6 +1248,7 @@ class PolicyDecider:
     ) -> Decision:
         if self.switched:
             return Decision(self.committed_frontier, False, REASON_ALREADY_SWITCHED)
+        self.peak_actual_live = max(self.peak_actual_live, int(actual_live))
         table = self.policy.table
         assert table is not None
 
@@ -1288,22 +1318,23 @@ class PolicyStore:
 
     * raises ``PolicyRevisionError`` (keeping the previous policy installed)
       when the file is unreadable/invalid or its revision went backwards;
-    * with ``require_advance=True`` also raises when the revision did not
-      advance (fail closed: a stale table must not silently drive the next
-      rollout);
+    * with ``require_advance`` (the default) also raises when the revision
+      did not advance (fail closed: a stale table must not silently drive
+      the next rollout).  The first ``reload`` after ``load`` is exempt: the
+      online calibrator has not run yet at the first rollout boundary (the
+      archived EMA runs reload before rollout 1 with revision 0 == 0);
     * otherwise installs the new policy (or keeps the identical one).
 
     Inline specs have no file; ``reload`` returns the same policy.
     """
 
-    def __init__(
-        self, spec: str | PolicySpec, *, require_advance: bool = False
-    ) -> None:
+    def __init__(self, spec: str | PolicySpec, *, require_advance: bool = True) -> None:
         self.spec = spec if isinstance(spec, PolicySpec) else PolicySpec.parse(spec)
         self.require_advance = require_advance
         self._policy: PrecisionPolicy | None = None
         self.reload_count = 0
         self.last_reload_advanced = False
+        self._first_reload_pending = False
 
     @property
     def policy(self) -> PrecisionPolicy:
@@ -1317,6 +1348,7 @@ class PolicyStore:
 
     def load(self) -> PrecisionPolicy:
         self._policy = load_precision_policy(self.spec)
+        self._first_reload_pending = True
         return self._policy
 
     def reload(self) -> PrecisionPolicy:
@@ -1337,7 +1369,9 @@ class PolicyStore:
                 f"{candidate.policy_revision} ({self.spec})"
             )
         advanced = candidate.policy_revision > current.policy_revision
-        if not advanced and self.require_advance:
+        first_reload = self._first_reload_pending
+        self._first_reload_pending = False
+        if not advanced and self.require_advance and not first_reload:
             raise PolicyRevisionError(
                 f"policy revision did not advance from "
                 f"{current.policy_revision} ({self.spec})"

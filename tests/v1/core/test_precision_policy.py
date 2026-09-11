@@ -258,7 +258,7 @@ def test_degenerate_policy_round_trips_through_schema6_json(tmp_path):
     path = tmp_path / "fixed_t4.json"
     path.write_text(json.dumps(policy.to_json()))
     loaded = load_precision_policy(str(path))
-    assert loaded.kind == KIND_LOOKUP  # a JSON table is a plain lookup policy
+    assert loaded.kind == KIND_FIXED_THRESHOLD  # recorded in calibration.kind
     assert loaded.table == policy.table
     assert loaded.max_switch_live_batch == 4
     assert loaded.commitment_enabled is False  # no initial_rollout_batch given
@@ -270,6 +270,23 @@ def test_degenerate_policy_round_trips_through_schema6_json(tmp_path):
     path.write_text(json.dumps(payload))
     reloaded = load_precision_policy(str(path))
     assert reloaded.kind == KIND_FIXED_FRONTIER and reloaded.table == fixed.table
+
+
+@pytest.mark.parametrize(
+    "spec", ["fixed_threshold:4", "fixed_frontier:8000", "uniform_w4"]
+)
+def test_every_inline_kind_round_trips_with_its_kind(tmp_path, spec):
+    policy = load_precision_policy(spec)
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(policy.to_json()))
+    reloaded = load_precision_policy(str(path))
+    assert reloaded.kind == policy.kind
+    assert reloaded.table == policy.table
+    assert reloaded.max_switch_live_batch == policy.max_switch_live_batch
+    assert reloaded.capture_max_batch == policy.capture_max_batch
+    assert reloaded.fixed_switch_frontier == policy.fixed_switch_frontier
+    decider = PolicyDecider(reloaded)
+    assert decider.switched == (spec == "uniform_w4")
 
 
 # ---------------------------------------------------------------------------
@@ -378,9 +395,7 @@ def test_loader_accepts_fixed_switch_frontier_without_a_table():
     policy = policy_from_json(raw)
     assert policy.kind == KIND_FIXED_FRONTIER
     assert policy.fixed_switch_frontier == 1000
-    assert (
-        policy.table is not None and policy.table.frontier_count == (4096 - 250) // 250
-    )
+    assert policy.table is not None and policy.table.frontier_count == 16
     assert policy.table.committed_frontier(250, 0, 1) == 1000
     assert policy.table.committed_frontier(3750, 512, 64) == 1000
     assert policy.initial_rollout_batch is None  # cohort-free arming (profiler)
@@ -537,6 +552,21 @@ def test_lookup_axis_semantics():
     assert zero.committed_frontier(250, 0, 2) == 7
     assert table.frontier_tokens == (250, 500, 750)
     assert table.prompt_bucket_tokens == (0, 128, 256)
+
+
+@pytest.mark.parametrize("cap, expected", [(16384, 65), (24576, 98), (2000, 7)])
+def test_frontier_bins_follow_the_archived_builders(cap, expected):
+    # np.arange(step, cap, step): 250..16250 -> 65 bins, 250..24500 -> 98.
+    table = LookupTable.constant(8000, scan_interval_tokens=250, response_cap=cap)
+    assert table.frontier_count == expected
+    assert table.frontier_tokens[-1] == 250 * expected < cap
+    model = CostModel(
+        _synthetic_cost_model(response_cap=cap),
+        scan_interval_tokens=250,
+        capture_max_batch=4,
+    )
+    assert model.frontier_count == expected
+    assert model.frontier_tokens(expected - 1) == 250 * expected
 
 
 def test_lookup_table_json_round_trip():
@@ -708,6 +738,27 @@ def test_fixed_threshold_spec_switches_on_drain():
         _observe(decider, 250, 3, actual=3, tokens=400).reason == REASON_GUARD_BLOCKED
     )
     assert _observe(decider, 250, 2, actual=2, tokens=400).switch_now
+
+
+def test_fixed_threshold_arms_only_after_the_batch_exceeded_the_threshold():
+    # The archived latch: a small live count while an asynchronously admitted
+    # cohort is still arriving is not a drain.
+    decider = PolicyDecider(load_precision_policy("fixed_threshold:8"))
+    early = decider.observe(250, 60.0, 3, 3, 250)
+    assert not early.switch_now and early.reason == REASON_GUARD_BLOCKED
+    assert decider.peak_actual_live == 3 and not decider.guard_allows(3)
+    assert (
+        _observe(decider, 250, 64, actual=64, tokens=300).reason == REASON_GUARD_BLOCKED
+    )
+    assert decider.peak_actual_live == 64
+    drained = _observe(decider, 250, 8, actual=8, tokens=300)
+    assert drained.switch_now and decider.switched
+    decider.reset()
+    assert decider.peak_actual_live == 0
+    # Other kinds do not latch: fixed_frontier switches at its frontier for
+    # any live history.
+    plain = PolicyDecider(load_precision_policy("fixed_frontier:250"))
+    assert plain.observe(250, 60.0, 3, 3, 250).switch_now
 
 
 def test_fixed_frontier_spec_switches_at_the_frontier_for_any_batch():
@@ -954,9 +1005,11 @@ def test_policy_store_reload_installs_only_advanced_revisions(tmp_path):
     path = tmp_path / "policy.json"
     _write_policy(path, 0)
     store = PolicyStore(str(path))
+    assert store.require_advance
     first = store.load()
     assert store.revision == 0 and store.policy is first
-    # Same revision, changed content: keep the installed policy.
+    # First reload after load: an unchanged revision is accepted (the
+    # calibrator has not run before rollout 1); the policy is kept.
     _write_policy(path, 0, [8000, 8000])
     assert store.reload() is first and not store.last_reload_advanced
     # Advanced revision: install.
@@ -976,15 +1029,34 @@ def test_policy_store_reload_installs_only_advanced_revisions(tmp_path):
     assert store.policy is second and store.reload_count == 2
 
 
-def test_policy_store_fails_closed_when_advance_is_required(tmp_path):
+def test_policy_store_fails_closed_when_the_revision_does_not_advance(tmp_path):
     path = tmp_path / "policy.json"
     _write_policy(path, 3)
-    store = PolicyStore(str(path), require_advance=True)
+    store = PolicyStore(str(path))
     store.load()
+    assert store.reload().policy_revision == 3  # first reload: exempt
     with pytest.raises(PolicyRevisionError, match="did not advance"):
-        store.reload()
+        store.reload()  # second reload without a bump: stale table
+    assert store.policy.policy_revision == 3
     _write_policy(path, 4)
     assert store.reload().policy_revision == 4
+    with pytest.raises(PolicyRevisionError, match="did not advance"):
+        store.reload()
+    # A fresh load() re-arms the exemption.
+    store.load()
+    assert store.reload().policy_revision == 4
+
+
+def test_policy_store_can_tolerate_unchanged_revisions(tmp_path):
+    path = tmp_path / "policy.json"
+    _write_policy(path, 3)
+    store = PolicyStore(str(path), require_advance=False)
+    store.load()
+    for _ in range(3):
+        assert store.reload().policy_revision == 3 and not store.last_reload_advanced
+    _write_policy(path, 2)
+    with pytest.raises(PolicyRevisionError, match="backwards"):
+        store.reload()
 
 
 def test_policy_store_reload_is_a_no_op_for_inline_specs():
