@@ -10,6 +10,7 @@ cosine >= 0.95; measured 0.9856). One GPU, ~25 GiB, about one minute.
 """
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -84,6 +85,7 @@ def llm(monkeypatch_module):
     monkeypatch_module.setenv("VLLM_DUAL_PRECISION_INT4_MODEL", QWEN35_9B_AUTOROUND)
     monkeypatch_module.setenv("VLLM_DUAL_PRECISION_BF16_LAYERS", "none")
     monkeypatch_module.setenv("VLLM_DUAL_PRECISION_INT4_MODULES", "all")
+    monkeypatch_module.setenv("VLLM_DUAL_PRECISION_VALIDATE_LIFECYCLE", "1")
     llm = LLM(
         model=QWEN35_9B_BF16,
         dtype="bfloat16",
@@ -93,6 +95,7 @@ def llm(monkeypatch_module):
         max_num_seqs=4,
         gpu_memory_utilization=0.75,
         enforce_eager=True,
+        enable_sleep_mode=True,
         # Keep the vision tower (as the archived runs did): its 110 linears
         # are the bulk of the 134 fallback linears in the recorded log line.
         seed=0,
@@ -136,3 +139,72 @@ def test_engine_generates_with_shadow_attached(llm):
         ["The capital of France is"], SamplingParams(temperature=0, max_tokens=8)
     )
     assert len(outputs[0].outputs[0].token_ids) == 8
+
+
+def _lifecycle_after_weight_sync(model) -> dict:
+    """Runs inside the worker after sleep(1)/wake_up: replay verl's weight-sync
+    post-processing with and without the shadow hidden, then probe."""
+    from vllm.model_executor.dual_precision import (
+        BASE_PRECISION_INT4,
+        SHADOW_MODULE_NAME,
+        bind_dual_precision,
+        get_dual_precision_state,
+    )
+    from vllm.model_executor.dual_precision.validation import run_lifecycle_probes
+    from vllm.model_executor.model_loader.utils import process_weights_after_loading
+
+    state = get_dual_precision_state(model)
+    device = next(model.parameters()).device
+    # process_weights_after_loading only reads dtype/quantization from it.
+    model_config = SimpleNamespace(dtype=torch.bfloat16, quantization=None)
+
+    # verl's _hide_dual_precision_shadow_model: pop the store around the call.
+    shadow = model._modules.pop(SHADOW_MODULE_NAME)
+    try:
+        process_weights_after_loading(model, model_config, device)
+    finally:
+        model._modules[SHADOW_MODULE_NAME] = shadow
+    bind_dual_precision(model, BASE_PRECISION_INT4)  # first INT4 bind -> validation
+    with_hide = [
+        (r.name, r.exact, r.max_abs)
+        for r in run_lifecycle_probes(state.lifecycle_probes)
+    ]
+
+    # Without the helper the Marlin repack visits the packed shadow again: on
+    # this vLLM base it asserts (the packed parameter is no longer a
+    # BasevLLMParameter after the first repack); older bases silently
+    # re-packed and corrupted the store. Either way the probes cannot pass.
+    without_hide_error = None
+    try:
+        process_weights_after_loading(model, model_config, device)
+    except Exception as exc:  # noqa: BLE001 - the failure mode is the point
+        without_hide_error = f"{type(exc).__name__}: {exc}"
+    without_hide = [
+        (r.name, r.exact, r.max_abs)
+        for r in run_lifecycle_probes(state.lifecycle_probes)
+    ]
+    return {
+        "num_probes": len(state.lifecycle_probes),
+        "validated": state.lifecycle_validated,
+        "with_hide": with_hide,
+        "without_hide": without_hide,
+        "without_hide_error": without_hide_error,
+    }
+
+
+def test_lifecycle_probes_exact_after_sleep_wake_and_weight_sync(llm):
+    """Audit test 5. Runs last: it deliberately corrupts the shadow store."""
+    llm.sleep(level=1)
+    llm.wake_up()
+    (report,) = llm.apply_model(_lifecycle_after_weight_sync)
+
+    assert report["num_probes"] == 6 and report["validated"]
+    assert all(exact and max_abs == 0 for _, exact, max_abs in report["with_hide"]), (
+        report
+    )
+    # The hide helper is load-bearing: a second repack either raises inside
+    # the Marlin kernel (this base) or breaks the probes.
+    assert report["without_hide_error"] is not None or not any(
+        exact for _, exact, _ in report["without_hide"]
+    ), report
+    print("without hide:", report["without_hide_error"], report["without_hide"][:2])
