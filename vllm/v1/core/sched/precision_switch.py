@@ -206,13 +206,22 @@ class RolloutPrecisionSwitcher:
         observations_path: str | None = None,
         writer: SwitchLogWriter | None = None,
         log: Callable[..., None] | None = None,
+        contract_log: Callable[..., None] | None = None,
     ) -> None:
         self.store = store
         self.reload_each_rollout = reload_each_rollout
         if writer is None and observations_path:
             writer = SwitchLogWriter(observations_path)
         self.writer = writer
+        # ``log`` carries the informational lines (INFO). The log-line contract
+        # (switch, policy reload and reload lag: one line per event) goes out
+        # at WARNING as the archived runs did, because verl launches vLLM with
+        # VLLM_LOGGING_LEVEL=WARN and its validate_rollout_run.py parses them.
+        # A single ``log`` override captures both (tests).
         self._log = log if log is not None else logger.info
+        if contract_log is None:
+            contract_log = log if log is not None else logger.warning
+        self._log_contract = contract_log
         self.decider = PolicyDecider(store.policy)
         self.rollout_index = 0
         self.forced_precision: str | None = None
@@ -363,7 +372,7 @@ class RolloutPrecisionSwitcher:
         lagged = next_rollout_index >= 2 and not self.store.last_reload_advanced
         if lagged:
             self.policy_reload_lag_count += 1
-            self._log(
+            self._log_contract(
                 "Precision policy reload lagged before rollout %d: revision=%d "
                 "unchanged (calibrator did not finish); running on the previous "
                 "table (lag_count=%d)",
@@ -371,7 +380,7 @@ class RolloutPrecisionSwitcher:
                 revision,
                 self.policy_reload_lag_count,
             )
-        self._log(
+        self._log_contract(
             "Reloaded dynamic precision policy before rollout %d: revision=%d",
             next_rollout_index,
             revision,
@@ -556,8 +565,9 @@ class RolloutPrecisionSwitcher:
         self.switches.append(event)
         if self.writer is not None:
             self.writer.write(event)
-        # Log-line contract kept verbatim: the archived audits parse it.
-        self._log(
+        # Log-line contract kept verbatim (and at WARNING): the archived
+        # audits and verl's validate_rollout_run.py parse it.
+        self._log_contract(
             "Lookup dynamic full-cost switch: rollout_index=%d, "
             "committed_frontier=%d, applied_response_tokens=%d, "
             "applied_live_requests=%d",

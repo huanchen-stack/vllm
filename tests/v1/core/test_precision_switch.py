@@ -686,6 +686,67 @@ def _grow(request, tokens: int) -> None:
     request.append_output_token_ids([123] * tokens)
 
 
+def test_contract_lines_are_logged_at_warning_and_the_rest_at_info(tmp_path, caplog):
+    """verl launches vLLM with VLLM_LOGGING_LEVEL=WARN and its
+    validate_rollout_run.py parses the switch / reload lines, so those go out
+    at WARNING (one line per event, as archived); arming, cohort and
+    commitment chatter stays INFO."""
+    import logging
+
+    raw = _fixed_frontier_json(1000, batch=1, calibration={"policy_revision": 0})
+    path = _write_policy(tmp_path, raw)
+    switcher = RolloutPrecisionSwitcher.from_settings(
+        path, reload_each_rollout=True, require_advance=False
+    )
+    with caplog.at_level(logging.INFO, logger="vllm.v1.core.sched.precision_switch"):
+        switcher.on_new_request("a")  # rollout 1: reload
+        assert switcher.tick(_step(_live(("a", 10, 1000)))) == INT4  # switch
+        switcher.on_new_request("b")  # rollout 2: unchanged revision -> lag
+    by_level = {
+        logging.WARNING: [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ],
+        logging.INFO: [
+            r.getMessage() for r in caplog.records if r.levelno == logging.INFO
+        ],
+    }
+    warnings = by_level[logging.WARNING]
+    assert (
+        sum(
+            m.startswith("Lookup dynamic full-cost switch: rollout_index=1")
+            for m in warnings
+        )
+        == 1
+    )
+    assert (
+        sum(
+            m.startswith("Reloaded dynamic precision policy before rollout 1")
+            for m in warnings
+        )
+        == 1
+    )
+    assert (
+        sum(
+            m.startswith("Reloaded dynamic precision policy before rollout 2")
+            for m in warnings
+        )
+        == 1
+    )
+    assert (
+        sum(
+            m.startswith("Precision policy reload lagged before rollout 2")
+            for m in warnings
+        )
+        == 1
+    )
+    assert len(warnings) == 4, warnings
+    assert any(m.startswith("Precision rollout armed") for m in by_level[logging.INFO])
+    assert not any(
+        m.startswith(("Lookup dynamic", "Reloaded dynamic", "Precision policy reload"))
+        for m in by_level[logging.INFO]
+    )
+
+
 def test_vanilla_scheduler_reports_none_with_the_policy_flag_empty(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_DUAL_PRECISION_POLICY", "")
     scheduler = create_scheduler(max_num_seqs=4)

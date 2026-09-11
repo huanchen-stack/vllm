@@ -140,9 +140,17 @@ audit check which revision drove a switch. The same record is kept in memory
 The log line `Lookup dynamic full-cost switch: rollout_index=%d,
 committed_frontier=%d, applied_response_tokens=%d, applied_live_requests=%d`
 is emitted verbatim for every kind (it is the `SWITCH_RE` contract of the
-archived audits); `Dynamic precision receding lookup updated: ...` and
-`Reloaded dynamic precision policy before rollout %d: revision=%d` keep their
-formats too.
+archived audits); `Reloaded dynamic precision policy before rollout %d:
+revision=%d` and `Precision policy reload lagged before rollout %d: ...`
+keep their formats too. These three contract lines are logged at
+**WARNING** (one line per event, as the archived runs did): verl launches
+vLLM with `VLLM_LOGGING_LEVEL=WARN`, and at INFO they were invisible to
+`validate_rollout_run.py` from a recipe launch (integration defect 3). The
+informational lines (`Precision rollout armed`, `... cohort complete`,
+`Dynamic precision lookup commitment updated`, `... receding lookup
+updated`) stay at INFO and the per-step trace at DEBUG. The switcher takes
+`log` (informational) and `contract_log` callables; a single `log` override
+captures both.
 
 ### Reload at rollout boundaries
 
