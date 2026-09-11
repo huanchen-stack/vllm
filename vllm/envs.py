@@ -159,6 +159,7 @@ if TYPE_CHECKING:
     VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY: str = ""
     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
+    VLLM_MARLIN_INPUT_PADDING: bool = False
     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
@@ -1332,6 +1333,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use atomicAdd reduce in gptq/awq marlin kernel.
     "VLLM_MARLIN_USE_ATOMIC_ADD": lambda: (
         os.environ.get("VLLM_MARLIN_USE_ATOMIC_ADD", "0") == "1"
+    ),
+    # Permit symmetric groupwise compressed-tensors WNA16 layers whose input
+    # dimension K is not a Marlin tile multiple (128) to append all-zero
+    # quantization groups with unit scales so the Marlin kernel can be used
+    # instead of the Triton fallback (e.g. Nemotron-Nano-9B-v2 down_proj,
+    # K=15680). Activations are zero-padded by the same amount at execution
+    # time, so the result is mathematically unchanged. Only TP=1 (or
+    # non-row-parallel) layers are padded. Default off.
+    "VLLM_MARLIN_INPUT_PADDING": lambda: (
+        os.environ.get("VLLM_MARLIN_INPUT_PADDING", "0") == "1"
     ),
     # Whether to use marlin kernel in mxfp4 quantization method
     # Deprecated: use --moe-backend marlin (MoE) or --linear-backend marlin

@@ -116,6 +116,10 @@ _TEXT_GENERATION_MODELS = {
     "Rnj1ForCausalLM": ("rnj1", "Rnj1ForCausalLM"),
     "Gemma3nForCausalLM": ("gemma3n", "Gemma3nForCausalLM"),
     "Gemma4ForCausalLM": ("gemma4", "Gemma4ForCausalLM"),
+    # Encoder-free Gemma 4 Unified checkpoints share the same text decoder and
+    # weight prefix layout.  This text-only entry deliberately skips the
+    # vision/audio embedders for language-model-only experiments.
+    "Gemma4UnifiedForConditionalGeneration": ("gemma4", "Gemma4ForCausalLM"),
     "Qwen3NextForCausalLM": ("qwen3_next", "Qwen3NextForCausalLM"),
     "GlmForCausalLM": ("glm", "GlmForCausalLM"),
     "Glm4ForCausalLM": ("glm4", "Glm4ForCausalLM"),

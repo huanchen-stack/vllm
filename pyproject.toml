@@ -104,6 +104,7 @@ follow_imports = "silent"
 markers = [
     "slow_test",
     "skip_global_cleanup",
+    "gpu_smoke: single-GPU smoke tests of the precision scheduler branch (run on request)",
     "core_model: enable this model test in each PR instead of only nightly",
     "hybrid_model: models that contain mamba layers (including pure SSM and hybrid architectures)",
     "cpu_model: enable this model test in CPU tests",
