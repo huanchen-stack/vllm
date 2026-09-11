@@ -267,21 +267,36 @@ def attach_shadow_layers(
     wrappers = find_lora_wrappers(model)
     wrapped_base_names = {f"{name}.base_layer" for name in wrappers}
 
+    # Counts follow the archived log line and cover every BF16 ``LinearBase``
+    # (wrapped or not): ``fallback`` has no quantized peer, ``policy_bf16`` is
+    # excluded by the layer/module policy, ``attached`` joins the store, and
+    # ``unwrapped`` would attach but has no LoRA wrapper to switch through.
+    attached = policy_bf16 = fallback = unwrapped = 0
+    bare_linears = [
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, LinearBase) and name not in wrapped_base_names
+    ]
+    for name in list(wrappers) + bare_linears:
+        if name not in quantized:
+            fallback += 1
+        elif not should_attach_int4_shadow(name, bf16_layer_indices, module_policy):
+            policy_bf16 += 1
+        elif name in wrappers:
+            attached += 1
+        else:
+            unwrapped += 1
+
     bindings: list[DualPrecisionBinding] = []
     attached_layers: list[tuple[str, LinearBase]] = []
     validations: list[ShadowValidation] = []
     probes: list[LifecycleProbe] = []
-    attached = policy_bf16 = fallback = 0
     for name, wrapper in wrappers.items():
         layer_index = transformer_layer_index(name)
         int4_layer = quantized.get(name)
-        if int4_layer is None:
-            fallback += 1
-        elif not should_attach_int4_shadow(name, bf16_layer_indices, module_policy):
-            policy_bf16 += 1
-            int4_layer = None
-        else:
-            attached += 1
+        if int4_layer is not None and should_attach_int4_shadow(
+            name, bf16_layer_indices, module_policy
+        ):
             attached_layers.append((name, int4_layer))
             if validate_shadow:
                 validations.append(
@@ -289,23 +304,13 @@ def attach_shadow_layers(
                 )
             if validate_lifecycle and len(probes) < MAX_LIFECYCLE_PROBES:
                 probes.append(record_lifecycle_probe(name, int4_layer, dtype))
+        else:
+            int4_layer = None
         bindings.append(
             install_binding(
                 wrapper, name, int4_layer, layer_index, static_forward_context
             )
         )
-
-    # LinearBase modules that LoRA did not wrap cannot switch precision; they
-    # stay BF16 and are counted for the log line only.
-    unwrapped = 0
-    for name, module in model.named_modules():
-        if (
-            isinstance(module, LinearBase)
-            and name not in wrapped_base_names
-            and name in quantized
-            and should_attach_int4_shadow(name, bf16_layer_indices, module_policy)
-        ):
-            unwrapped += 1
 
     if attached == 0:
         raise RuntimeError(

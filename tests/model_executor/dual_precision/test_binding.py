@@ -64,6 +64,7 @@ def test_attach_installs_overrides_and_shadow_store_without_lora_wrapping_shadow
     model, state, sfc = _attach()
 
     assert (state.attached, state.policy_bf16, state.fallback) == (4, 0, 1)
+    assert state.unwrapped == 0
     assert list(model._modules).count(SHADOW_MODULE_NAME) == 1
     store = model._modules[SHADOW_MODULE_NAME]
     assert store is state.shadow_store and len(store) == 4
