@@ -290,6 +290,10 @@ if TYPE_CHECKING:
     VLLM_DUAL_PRECISION_INT4_MODULES: str = "all"
     VLLM_DUAL_PRECISION_VALIDATE_SHADOW: bool = False
     VLLM_DUAL_PRECISION_VALIDATE_LIFECYCLE: bool = False
+    VLLM_DUAL_PRECISION_POLICY: str = ""
+    VLLM_DUAL_PRECISION_ONLINE_OBSERVATIONS: str = ""
+    VLLM_DUAL_PRECISION_RELOAD_POLICY_EACH_ROLLOUT: bool = False
+    VLLM_DUAL_PRECISION_REQUIRE_POLICY_ADVANCE: bool = False
 
 
 def get_default_cache_root():
@@ -2061,6 +2065,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weight sync) to prove the shadow store survived the lifecycle.
     "VLLM_DUAL_PRECISION_VALIDATE_LIFECYCLE": lambda: bool(
         int(os.getenv("VLLM_DUAL_PRECISION_VALIDATE_LIFECYCLE", "0"))
+    ),
+    # --- Rollout precision switching (vllm/v1/core/sched/precision_switch) ---
+    # Switching policy for dual-precision rollouts: an inline spec
+    # (``fixed_threshold:<t>``, ``fixed_frontier:<K>``, ``uniform_w4``) or a
+    # path to a policy JSON (see docs/design/precision_policy.md). Empty
+    # (default) disables the scheduler-side switcher entirely and leaves
+    # SchedulerOutput.dual_precision_base_precision at None.
+    "VLLM_DUAL_PRECISION_POLICY": lambda: os.getenv("VLLM_DUAL_PRECISION_POLICY", ""),
+    # Append one JSON line per rollout switch (the "switch cohort": every live
+    # request with its response length at the switch) to this path. Consumed
+    # by the online hazard-EMA calibrator. Empty (default) disables logging.
+    "VLLM_DUAL_PRECISION_ONLINE_OBSERVATIONS": lambda: os.getenv(
+        "VLLM_DUAL_PRECISION_ONLINE_OBSERVATIONS", ""
+    ),
+    # Re-read the policy JSON once at every rollout boundary (online
+    # calibration). An unchanged calibration.policy_revision is logged as a
+    # lag and recorded in the switch-cohort JSONL; a revision that went
+    # backwards or an invalid file always raises. Default off.
+    "VLLM_DUAL_PRECISION_RELOAD_POLICY_EACH_ROLLOUT": lambda: bool(
+        int(os.getenv("VLLM_DUAL_PRECISION_RELOAD_POLICY_EACH_ROLLOUT", "0"))
+    ),
+    # Strict fallback for the reload above: fail closed (raise) when the
+    # revision did not advance at a boundary (rollout 2 onwards). The primary
+    # lag protection is the verl-side policy barrier
+    # (precision_scheduler.policy_barrier_timeout_s). Default off.
+    "VLLM_DUAL_PRECISION_REQUIRE_POLICY_ADVANCE": lambda: bool(
+        int(os.getenv("VLLM_DUAL_PRECISION_REQUIRE_POLICY_ADVANCE", "0"))
     ),
 }
 
