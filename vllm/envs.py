@@ -280,6 +280,8 @@ if TYPE_CHECKING:
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_PROMPT_LOGPROB_EXTRA_TOKEN_IDS: list[int] = []
+    ROLLOUT_QLORA: bool = False
+    VLLM_ROLLOUT_LORA_FUSE_PACKED: bool = True
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
 
@@ -1993,6 +1995,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         for token_id in os.getenv("VLLM_PROMPT_LOGPROB_EXTRA_TOKEN_IDS", "").split(",")
         if token_id.strip()
     ],
+    # Enable the single-adapter rollout LoRA fast path: LoRA linear layers
+    # run as two torch GEMMs (x @ A^T @ B^T) instead of the Punica
+    # shrink/expand kernels, packed slices (QKV, gate-up, Qwen3.5 in_proj)
+    # are fused into one GEMM pair, and Punica metadata preparation (which
+    # contains a device-to-host sync) is skipped unless a Punica entry point
+    # is hit. Requires exactly one active adapter per batch and
+    # fully_sharded_loras=False; mixed batches fall back to Punica.
+    "ROLLOUT_QLORA": lambda: bool(int(os.getenv("ROLLOUT_QLORA", "0"))),
+    # When the rollout fast path is active, fuse the packed slices of a
+    # merged layer into a single GEMM pair (1, default) or run one torch
+    # GEMM pair per slice (0). Only used for the kernel ablation.
+    "VLLM_ROLLOUT_LORA_FUSE_PACKED": lambda: bool(
+        int(os.getenv("VLLM_ROLLOUT_LORA_FUSE_PACKED", "1"))
+    ),
     # If set to 1, use Python spinloop extension to poll in a more efficient
     # way when using the mp backend.
     "VLLM_USE_SPINLOOP_EXT": lambda: bool(int(os.getenv("VLLM_USE_SPINLOOP_EXT", "0"))),

@@ -9,6 +9,7 @@ from vllm.lora.ops.torch_ops.lora_ops import (
     sgmv_expand_slice,
     sgmv_shrink,
 )
+from vllm.lora.ops.torch_ops.rollout_lora_ops import rollout_lora_matmul
 
 __all__ = [
     "bgmv_expand",
@@ -17,4 +18,5 @@ __all__ = [
     "sgmv_expand",
     "sgmv_expand_slice",
     "sgmv_shrink",
+    "rollout_lora_matmul",
 ]

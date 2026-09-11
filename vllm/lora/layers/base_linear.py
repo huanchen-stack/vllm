@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Callable
 
 import torch
 from transformers import PretrainedConfig
@@ -21,7 +22,10 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.platforms import current_platform
-from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+from vllm.utils.multi_stream_utils import (
+    execute_in_parallel,
+    maybe_execute_in_parallel,
+)
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .base import BaseLayerWithLoRA
@@ -72,6 +76,19 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
 
         self._enable_aux_cuda_stream = envs.VLLM_LORA_ENABLE_DUAL_STREAM
         self.base_layer = base_layer
+        # Single-adapter rollout fast path (ROLLOUT_QLORA). Read once at
+        # construction so that the forward path never touches os.environ.
+        self._rollout_lora_enabled = envs.ROLLOUT_QLORA
+        # Packed per-slot LoRA A/B buffers for the rollout fast path, see
+        # _create_rollout_lora_weights. None unless ROLLOUT_QLORA is set.
+        self.rollout_lora_a_stacked: torch.Tensor | None = None
+        self.rollout_lora_b_stacked: torch.Tensor | None = None
+        # Optional replacement for the base GEMM in apply(); see
+        # set_base_forward_override. Used by the dual-precision component to
+        # select between base weight sets outside the compiled graph.
+        self.base_forward_override: (
+            Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor] | None
+        ) = None
         self.input_size = self.base_layer.input_size
         # Ensure tp_size and tp_rank consistency with the base_layer.
         self.tp_size = self.base_layer.tp_size
@@ -148,11 +165,116 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
             for _ in range(self.n_slices)
         )
         self.output_slices = (self.lora_b_stacked[0].shape[2],)
+        self._create_rollout_lora_weights(max_loras)
+
+    def set_base_forward_override(
+        self,
+        fn: Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor] | None,
+    ) -> None:
+        """Install (or clear with None) a replacement for the base GEMM.
+
+        When set, apply() computes the base output as ``fn(x, bias)`` and then
+        applies LoRA synchronously on the same stream; the dual-stream op is
+        not used. The override must return a tensor of the same shape and
+        dtype as ``self.base_layer.quant_method.apply(self.base_layer, x,
+        bias)`` would.
+        """
+        self.base_forward_override = fn
+
+    def _create_rollout_lora_weights(self, max_loras: int) -> None:
+        """Allocate the packed LoRA buffers used by the rollout fast path.
+
+        Layout (per adapter slot ``i``):
+          rollout_lora_a_stacked[i, 0] = cat(lora_a_stacked[s][i, 0] for s)
+              shape (n_slices * R, input_size)
+          rollout_lora_b_stacked[i, 0] = block_diag(lora_b_stacked[s][i, 0])
+              shape (sum(output_slices), n_slices * R)
+        where R is the per-slice rank *capacity* of the stacked buffers
+        (lora_config.max_lora_rank), not the adapter's actual rank: slice
+        ``s`` occupies rank rows ``[s * R, (s + 1) * R)`` and output rows
+        ``[offset_s, offset_s + output_slices[s])``; unused rank rows and
+        columns stay zero and contribute nothing. With this layout a merged
+        layer (QKV, gate-up, Qwen3.5 in_proj) becomes one ``x @ A^T @ B^T``
+        GEMM pair.
+        """
+        if (
+            not self._rollout_lora_enabled
+            or not current_platform.is_cuda_alike()
+            or self.lora_config.fully_sharded_loras
+        ):
+            # The fast path lives in PunicaWrapperGPU and is gated off for
+            # fully sharded LoRA there as well; do not allocate what it
+            # would never read.
+            self.rollout_lora_a_stacked = None
+            self.rollout_lora_b_stacked = None
+            return
+
+        total_rank = sum(weight.shape[2] for weight in self.lora_a_stacked)
+        total_output = sum(self.output_slices)
+        self.rollout_lora_a_stacked = torch.zeros(
+            max_loras,
+            1,
+            total_rank,
+            self.input_size,
+            dtype=self.lora_config.lora_dtype,
+            device=self.device,
+        )
+        self.rollout_lora_b_stacked = torch.zeros(
+            max_loras,
+            1,
+            total_output,
+            total_rank,
+            dtype=self.lora_config.lora_dtype,
+            device=self.device,
+        )
+
+    def _refresh_rollout_lora_weights(self, index: int) -> None:
+        """Rebuild the packed buffers of slot ``index`` from lora_*_stacked."""
+        if self.rollout_lora_a_stacked is None or self.rollout_lora_b_stacked is None:
+            return
+
+        self.rollout_lora_a_stacked[index].zero_()
+        self.rollout_lora_b_stacked[index].zero_()
+
+        rank_offset = 0
+        output_offset = 0
+        for slice_idx, output_size in enumerate(self.output_slices):
+            lora_a = self.lora_a_stacked[slice_idx][index, 0]
+            lora_b = self.lora_b_stacked[slice_idx][index, 0]
+            # Rank capacity of this slice's stacked buffer (max_lora_rank).
+            rank = lora_a.shape[0]
+            assert lora_b.shape == (output_size, rank)
+
+            self.rollout_lora_a_stacked[
+                index, 0, rank_offset : rank_offset + rank, :
+            ].copy_(lora_a, non_blocking=True)
+            self.rollout_lora_b_stacked[
+                index,
+                0,
+                output_offset : output_offset + output_size,
+                rank_offset : rank_offset + rank,
+            ].copy_(lora_b, non_blocking=True)
+
+            rank_offset += rank
+            output_offset += output_size
+
+    def _rollout_lora_kwargs(self) -> dict[str, torch.Tensor]:
+        """Extra add_lora_linear kwargs; empty unless the fast path is on."""
+        if self.rollout_lora_a_stacked is None or self.rollout_lora_b_stacked is None:
+            return {}
+        return {
+            "rollout_lora_a_stacked": self.rollout_lora_a_stacked,
+            "rollout_lora_b_stacked": self.rollout_lora_b_stacked,
+        }
 
     def reset_lora(self, index: int):
         for s_index in range(self.n_slices):
             self.lora_a_stacked[s_index][index] = 0
             self.lora_b_stacked[s_index][index] = 0
+        if self.rollout_lora_a_stacked is not None:
+            self.rollout_lora_a_stacked[index] = 0
+        if self.rollout_lora_b_stacked is not None:
+            self.rollout_lora_b_stacked[index] = 0
 
     def set_lora(
         self,
@@ -181,8 +303,14 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         self.lora_b_stacked[0][index, 0, : lora_b.shape[0], : lora_b.shape[1]].copy_(
             lora_b, non_blocking=True
         )
+        self._refresh_rollout_lora_weights(index)
 
     def apply(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        if self.base_forward_override is not None:
+            # The override owns the base GEMM (e.g. the dual-precision base
+            # selector); LoRA is applied synchronously on the same stream and
+            # the dual-stream op is deliberately not used (design decision 1).
+            return self._apply_sync(x, bias)
         # is_forward_context_available for tower modules
         if self._enable_aux_cuda_stream and is_forward_context_available():
             output_size = sum(self.output_slices)
@@ -192,10 +320,18 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         else:
             return self._apply_sync(x, bias)
 
+    def _base_forward(
+        self, x: torch.Tensor, bias: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Base GEMM: the installed override if any, else quant_method.apply."""
+        if self.base_forward_override is not None:
+            return self.base_forward_override(x, bias)
+        return self.base_layer.quant_method.apply(self.base_layer, x, bias)
+
     def _apply_sync(
         self, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
-        output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
+        output = self._base_forward(x, bias)
         return self._apply_lora_to_output(x, output)
 
     def _apply_base_forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -216,7 +352,13 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
             x = x.flatten(0, 1)
 
         lora_output: torch.Tensor | None = self.punica_wrapper.add_lora_linear(
-            output, x, self.lora_a_stacked, self.lora_b_stacked, 1.0, self.output_slices
+            output,
+            x,
+            self.lora_a_stacked,
+            self.lora_b_stacked,
+            1.0,
+            self.output_slices,
+            **self._rollout_lora_kwargs(),
         )
         if not current_platform.can_update_inplace():
             output = lora_output
@@ -227,6 +369,38 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
             output = output.reshape(original_shape)
 
         return output
+
+    def _execute_lora_async(
+        self,
+        base_fn: Callable[[], torch.Tensor],
+        lora_fn: Callable[[], torch.Tensor],
+        lora_first: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run base_fn on the current stream and lora_fn on the LoRA stream.
+
+        ``lora_first=False`` is the vanilla order (base GEMM launched first,
+        then LoRA on the aux stream). ``lora_first=True`` launches the LoRA
+        GEMMs on the aux stream before the base GEMM, so the small LoRA
+        kernels are already queued when the large base GEMM starts; this is
+        the order used by the rollout fast path.
+        """
+        if lora_first:
+            output, aux_results = execute_in_parallel(
+                base_fn,
+                [lora_fn],
+                self._events[0],
+                [self._events[1]],
+                [self._lora_stream],
+                enable=True,
+            )
+            return output, aux_results[0]
+        return maybe_execute_in_parallel(
+            base_fn,
+            lora_fn,
+            self._events[0],
+            self._events[1],
+            self._lora_stream,
+        )
 
     def _apply_async_impl(
         self, x: torch.Tensor, bias: torch.Tensor | None = None
@@ -265,15 +439,12 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
                 1.0,
                 self.output_slices,
                 add_inputs=False,
+                **self._rollout_lora_kwargs(),
             )
             return lora_output
 
-        output, lora_result = maybe_execute_in_parallel(
-            base_fn,
-            lora_fn,
-            self._events[0],
-            self._events[1],
-            self._lora_stream,
+        output, lora_result = self._execute_lora_async(
+            base_fn, lora_fn, lora_first=self._rollout_lora_enabled
         )
 
         original_shape = output.shape if output.ndim == 3 else None

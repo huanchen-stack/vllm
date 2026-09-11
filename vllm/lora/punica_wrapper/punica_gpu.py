@@ -11,7 +11,10 @@ from typing import final
 
 import torch
 
+from vllm import envs
+from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping
+from vllm.lora.ops.torch_ops.rollout_lora_ops import rollout_lora_matmul
 from vllm.lora.utils import get_captured_lora_counts
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.utils.math_utils import round_up
@@ -27,6 +30,60 @@ if HAS_TRITON:
 from vllm import _custom_ops as ops
 
 from .punica_base import PunicaWrapperBase
+
+logger = init_logger(__name__)
+
+
+def select_rollout_single_lora_index(
+    index_mapping: tuple[int, ...] | list[int],
+    lora_index_to_id: list[int | None],
+    max_loras: int,
+) -> int | None:
+    """Pick the adapter slot the rollout fast path applies to every token.
+
+    Returns the slot index, or None when the batch must go through Punica.
+    ``index_mapping`` holds one LoRA id per token (0 = no adapter);
+    ``lora_index_to_id`` maps slots to ids (None = free slot).
+
+    Selection table:
+
+    | mapping                       | max_loras | result                     |
+    |-------------------------------|-----------|----------------------------|
+    | empty (profile / dummy run)   | 1         | slot 0                     |
+    | empty                         | >1        | None (Punica)              |
+    | two or more distinct ids > 0  | any       | None (Punica)              |
+    | exactly one id > 0            | any       | its slot; None if not found|
+    | only zeros, loaded slot exists| 1         | slot 0                     |
+    | only zeros                    | >1        | first non-free slot, else  |
+    |                               |           | None                       |
+
+    The all-zero rows exist so that CUDA-graph capture (which uses an
+    all-zero dummy mapping for the ``num_active_loras=0`` variant) and its
+    replay make the same decision: with a single slot the fast path is used
+    unconditionally, so the same kernels live in every captured graph. The
+    caller is expected to run only batches in which every token carries the
+    single adapter (verl sets ``max_loras=1`` and attaches the adapter to
+    every request); a batch with no LoRA requests would still have the slot's
+    weights applied, which is why the fast path is opt-in via ROLLOUT_QLORA.
+    """
+    if not index_mapping:
+        return 0 if max_loras == 1 else None
+
+    positive_lora_ids = {lora_id for lora_id in index_mapping if lora_id > 0}
+    if len(positive_lora_ids) > 1:
+        return None
+    if len(positive_lora_ids) == 1:
+        lora_id = next(iter(positive_lora_ids))
+        try:
+            return lora_index_to_id.index(lora_id)
+        except ValueError:
+            return None
+    if max_loras == 1:
+        return 0
+    return next(
+        (i for i, lora_id in enumerate(lora_index_to_id) if lora_id is not None),
+        None,
+    )
 
 
 @final
@@ -48,6 +105,30 @@ class PunicaWrapperGPU(PunicaWrapperBase):
 
         self.lora_config = kwargs["lora_config"]
         self.max_loras = self.lora_config.max_loras
+
+        # Rollout fast path state (ROLLOUT_QLORA). Env vars are read once
+        # here; the per-step decision lives in update_metadata.
+        self._rollout_fast_path_enabled = (
+            envs.ROLLOUT_QLORA and not self.lora_config.fully_sharded_loras
+        )
+        self._rollout_fuse_packed = envs.VLLM_ROLLOUT_LORA_FUSE_PACKED
+        if envs.ROLLOUT_QLORA and self.max_loras > 1:
+            logger.warning(
+                "ROLLOUT_QLORA is set with max_loras=%d. The fast path is only "
+                "supported with max_loras=1: under torch.compile the "
+                "single-adapter decision is frozen at first compile, so batches "
+                "that would need the Punica fallback are not handled.",
+                self.max_loras,
+            )
+        self._rollout_single_lora_index: int | None = None
+        self._rollout_fast_path_logged = False
+        self._rollout_fallback_logged = False
+        # Punica kernel metadata (LoRAKernelMeta.prepare_tensors) contains a
+        # device-to-host sync (torch.all -> host bool) plus sort/unique
+        # kernels. On the fast path it is prepared lazily, only if a Punica
+        # entry point is actually hit (logits, embedding, MoE, or a
+        # multi-adapter batch), so a plain decode step never syncs.
+        self._punica_metadata_prepared = False
 
         # Compute captured LoRA counts for cudagraph specialization.
         captured_lora_counts = get_captured_lora_counts(
@@ -83,9 +164,117 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         self.is_prefill = mapping.is_prefill
         self._update_base_metadata(mapping, lora_index_to_id, max_loras, vocab_size)
 
-        # Prepare cuda kernel metadata tensors
+        self._punica_metadata_prepared = False
+        if self._rollout_fast_path_enabled:
+            # Note: the `max_loras` argument is the manager's slot count + 1;
+            # the table keys on the configured number of slots.
+            self._rollout_single_lora_index = select_rollout_single_lora_index(
+                mapping.index_mapping, lora_index_to_id, self.max_loras
+            )
+            # Log the first decision of each kind here, outside the compiled
+            # forward (Dynamo drops logger calls it traces through).
+            if self._rollout_single_lora_index is None:
+                if not self._rollout_fallback_logged:
+                    self._rollout_fallback_logged = True
+                    logger.warning(
+                        "Rollout QLoRA fast path fallback to Punica: "
+                        "token_lora_ids=%s, lora_index_to_id=%s, tokens=%s.",
+                        sorted(set(mapping.index_mapping))[:8],
+                        lora_index_to_id,
+                        len(mapping.index_mapping),
+                    )
+            elif not self._rollout_fast_path_logged:
+                self._rollout_fast_path_logged = True
+                logger.warning(
+                    "Rollout QLoRA torch path active: fused_packed=%s, "
+                    "lora_index=%s, tokens=%s.",
+                    self._rollout_fuse_packed,
+                    self._rollout_single_lora_index,
+                    len(mapping.index_mapping),
+                )
+        else:
+            self._rollout_single_lora_index = None
+        if self._rollout_single_lora_index is None:
+            # Vanilla behaviour: prepare cuda kernel metadata tensors now.
+            self._prepare_punica_metadata()
+
+    def _prepare_punica_metadata(self) -> None:
+        if self._punica_metadata_prepared:
+            return
         self.token_mapping_meta.prepare_tensors(self.token_lora_indices)
         self.prompt_mapping_meta.prepare_tensors(self.sampler_indices)
+        self._punica_metadata_prepared = True
+
+    def _ensure_punica_metadata_prepared(self) -> None:
+        if not self._punica_metadata_prepared:
+            self._prepare_punica_metadata()
+
+    def _add_lora_linear_rollout(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        lora_a_stacked: tuple[torch.Tensor, ...],
+        lora_b_stacked: tuple[torch.Tensor, ...],
+        output_slices: tuple[int, ...],
+        scale: float,
+        add_inputs: bool,
+        rollout_lora_a_stacked: torch.Tensor | None,
+        rollout_lora_b_stacked: torch.Tensor | None,
+    ) -> bool:
+        """Single-adapter torch GEMM path. Returns False to fall back to Punica.
+
+        With ``VLLM_ROLLOUT_LORA_FUSE_PACKED=1`` the packed buffers from
+        BaseLinearLayerWithLoRA give one GEMM pair per layer; with 0 each
+        slice runs its own GEMM pair into ``y[:, offset:offset+size]``
+        (kernel ablation stage 2).
+        """
+        lora_index = self._rollout_single_lora_index
+        fuse_packed = self._rollout_fuse_packed and (
+            rollout_lora_a_stacked is not None and rollout_lora_b_stacked is not None
+        )
+        if lora_index is None or (self._rollout_fuse_packed and not fuse_packed):
+            # Punica handles this call (multi-adapter batch, or a layer
+            # without packed buffers while fusion is requested).
+            return False
+
+        x = x.view(-1, x.shape[-1])
+        y = y.view(-1, y.shape[-1])
+        assert y.shape[-1] == sum(output_slices)
+
+        if fuse_packed:
+            assert rollout_lora_a_stacked is not None
+            assert rollout_lora_b_stacked is not None
+            lora_output = rollout_lora_matmul(
+                x,
+                rollout_lora_a_stacked[lora_index, 0],
+                rollout_lora_b_stacked[lora_index, 0],
+                y.shape[-1],
+                scale,
+            ).to(dtype=y.dtype)
+            if add_inputs:
+                y.add_(lora_output)
+            else:
+                y.copy_(lora_output)
+            return True
+
+        output_offset = 0
+        for lora_a_weights, lora_b_weights, output_size in zip(
+            lora_a_stacked, lora_b_stacked, output_slices
+        ):
+            lora_output = rollout_lora_matmul(
+                x,
+                lora_a_weights[lora_index, 0],
+                lora_b_weights[lora_index, 0],
+                output_size,
+                scale,
+            ).to(dtype=y.dtype)
+            output_slice = y[:, output_offset : output_offset + output_size]
+            if add_inputs:
+                output_slice.add_(lora_output)
+            else:
+                output_slice.copy_(lora_output)
+            output_offset += output_size
+        return True
 
     def add_shrink(
         self,
@@ -110,6 +299,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         """
 
         x = x.view(-1, x.shape[-1])
+        self._ensure_punica_metadata_prepared()
         lora_shrink(
             x,
             lora_a_stacked,
@@ -150,6 +340,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         """
         y_org = y
         y = y.view(-1, y.shape[-1])
+        self._ensure_punica_metadata_prepared()
 
         assert x.ndim == 3
         assert x.size(0) == len(output_slices)
@@ -189,6 +380,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             add_inputs (bool): Default to True.
         """
 
+        self._ensure_punica_metadata_prepared()
         lora_expand(
             x.unsqueeze(dim=0),
             (lora_b_stacked,),
@@ -239,6 +431,23 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             "To minimize overhead, the buffer should be created by "
             ".add_lora_linear() instead of being passed in."
         )
+        add_inputs = kwargs.pop("add_inputs", True)
+        rollout_lora_a_stacked = kwargs.pop("rollout_lora_a_stacked", None)
+        rollout_lora_b_stacked = kwargs.pop("rollout_lora_b_stacked", None)
+        if self._rollout_fast_path_enabled and self._add_lora_linear_rollout(
+            y,
+            x,
+            lora_a_stacked,
+            lora_b_stacked,
+            output_slices,
+            scale,
+            add_inputs,
+            rollout_lora_a_stacked,
+            rollout_lora_b_stacked,
+        ):
+            return None
+
+        self._ensure_punica_metadata_prepared()
         r = lora_b_stacked[0].size(-1)
         # We set the buffer to be float32 by default, refer to:
         # https://github.com/triton-lang/triton/issues/1387
@@ -246,7 +455,6 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         buffer = torch.empty(
             (len(output_slices), x.size(0), r), dtype=torch.float32, device=x.device
         )
-        add_inputs = kwargs.pop("add_inputs", True)
         self.add_shrink(
             buffer,  # type: ignore
             x,
@@ -292,6 +500,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         y_org = y
         y = y.view(-1, y.shape[-1])
         x = x.view(-1, x.shape[-1])
+        self._ensure_punica_metadata_prepared()
         r = lora_b_stacked.size(-1)
 
         assert buffer is None, (
@@ -345,6 +554,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         read from `self.token_mapping_meta`. This is how EP+LoRA injects the
         per-rank-local token→LoRA map after all-to-all dispatch.
         """
+        self._ensure_punica_metadata_prepared()
         (
             token_lora_mapping_meta,
             _,
@@ -440,6 +650,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         """
         Performs a fused forward computation for LoRA of Mixture-of-Experts (MoE) layer.
         """
+        self._ensure_punica_metadata_prepared()
         (
             token_lora_mapping_meta,
             _,
