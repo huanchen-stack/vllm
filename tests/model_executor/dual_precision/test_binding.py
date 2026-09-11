@@ -163,9 +163,11 @@ def test_policy_and_mlp_only_reach_bindings():
     assert shadow_active == {"model.layers.1.mlp.down_proj"}
 
 
-def test_attach_raises_when_nothing_attaches():
+def test_attach_raises_when_nothing_attaches_and_leaves_model_untouched():
     model = build_wrapped_model(NAMES, HIDDEN)
     int4_model = build_int4_model(NAMES, set(), HIDDEN)
+    before = module_dict_snapshot(model)
+    sfc: dict = {}
     with pytest.raises(RuntimeError, match="no quantized LinearBase"):
         attach_shadow_layers(
             model,
@@ -173,6 +175,14 @@ def test_attach_raises_when_nothing_attaches():
             bf16_layer_policy="none",
             module_policy="all",
             num_layers=2,
-            static_forward_context={},
+            static_forward_context=sfc,
             dtype=torch.float32,
         )
+    assert module_dict_snapshot(model) == before
+    assert sfc == {}
+    assert get_dual_precision_state(model) is None
+    assert SHADOW_MODULE_NAME not in model._modules
+    for name in NAMES:
+        wrapper = model.get_submodule(name)
+        assert wrapper.base_forward_override is None
+        assert get_binding(wrapper) is None

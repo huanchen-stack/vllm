@@ -287,6 +287,14 @@ def attach_shadow_layers(
         else:
             unwrapped += 1
 
+    if attached == 0:
+        # Checked before anything is installed so a failed attach leaves the
+        # model exactly as it was (no overrides, no bindings, no store).
+        raise RuntimeError(
+            "Dual precision INT4 shadow model loaded, but no quantized LinearBase "
+            "layers were attached to a LoRA wrapper."
+        )
+
     bindings: list[DualPrecisionBinding] = []
     attached_layers: list[tuple[str, LinearBase]] = []
     validations: list[ShadowValidation] = []
@@ -310,12 +318,6 @@ def attach_shadow_layers(
             install_binding(
                 wrapper, name, int4_layer, layer_index, static_forward_context
             )
-        )
-
-    if attached == 0:
-        raise RuntimeError(
-            "Dual precision INT4 shadow model loaded, but no quantized LinearBase "
-            "layers were attached to a LoRA wrapper."
         )
 
     store = Int4ShadowLayerStore(attached_layers)

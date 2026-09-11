@@ -84,12 +84,13 @@ this component only makes both bases available and switchable.
 | `VLLM_DUAL_PRECISION_VALIDATE_SHADOW` | `0` | numerical check at load |
 | `VLLM_DUAL_PRECISION_VALIDATE_LIFECYCLE` | `0` | probes at load, re-check at first INT4 bind |
 
-verl: `actor_rollout_ref.rollout.model_path` (null: reuse the actor path) and
-`actor_rollout_ref.rollout.sleep_level` (null: engine default; env fallback
-`VERL_FORCE_VLLM_SLEEP_LEVEL`, read only in the config layer). With
-`VLLM_DUAL_PRECISION_ROLLOUT=1` in the environment the config forces level 1
-and refuses level 2. C8's `precision_scheduler` block will translate YAML
-into these env vars; until then they are set by hand.
+verl: `actor_rollout_ref.rollout.model_path` (null: reuse the actor path)
+and the C8 block `actor_rollout_ref.rollout.precision_scheduler.{enable,
+int4_model, bf16_layers, int4_modules, validate_shadow, validate_lifecycle,
+sleep_level}`, which verl translates into the env vars above for the server
+actor (`verl.workers.config.precision_scheduler`). `sleep_level` null keeps
+the engine default; `resolve_sleep_level` in that module applies it at both
+`engine.sleep` sites and keeps level 1 when dual precision is enabled.
 
 ## Contracts with neighbours
 
@@ -169,13 +170,11 @@ into these env vars; until then they are set by hand.
 
 ## Known gaps
 
-* `ReplicatedLinearWithLoRA.apply` calls `self.base_layer(x)` directly and
-  never reaches the override, so a `ReplicatedLinear` with a quantized peer
-  (Gemma4 `per_layer_input_gate` / `per_layer_projection` under
-  `INT4_MODULES=all`, MoE routers) is counted as attached but keeps running
-  BF16. `mlp_only`, used for every Gemma4 run, excludes them. Fixing this is
-  a C1 change (route `ReplicatedLinearWithLoRA.apply` through the base class
-  when an override is set).
+* `ReplicatedLinearWithLoRA.apply` used to call `self.base_layer(x)` directly
+  and bypass the override; resolved by C1 (commit f121b54413 on the clean
+  branch routes every LoRA linear `apply()` through the override when one is
+  installed). `test_real_lora_wrapper_routes_apply_through_override` covers
+  the base-class path.
 * Bind call sites in `execute_model`, `_dummy_run` and CUDA-graph capture
   are C3/C4's; until they land the engine attaches the shadow but always
   serves BF16.
