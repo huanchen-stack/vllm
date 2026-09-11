@@ -1,0 +1,496 @@
+{
+ "rule": "Observe every 250 tokens. Commit to the lowest-cost future frontier once modeled gain exceeds the conservative margin. Later observations may move the committed frontier earlier but never later.",
+ "summary": [
+  {
+   "action_grid_tokens": 1000,
+   "switch_frontiers": [
+    7500,
+    7500,
+    7750,
+    7500,
+    8500,
+    8250,
+    7250,
+    7500,
+    8250,
+    7250
+   ],
+   "switch_live_batches": [
+    15,
+    18,
+    16,
+    16,
+    21,
+    19,
+    12,
+    20,
+    18,
+    18
+   ],
+   "mean_initial_predicted_plan_cost_seconds": 878.5488351483204
+  },
+  {
+   "action_grid_tokens": 500,
+   "switch_frontiers": [
+    7500,
+    7500,
+    7750,
+    7250,
+    8250,
+    8250,
+    7250,
+    7500,
+    8250,
+    7500
+   ],
+   "switch_live_batches": [
+    15,
+    18,
+    16,
+    20,
+    23,
+    19,
+    12,
+    20,
+    18,
+    18
+   ],
+   "mean_initial_predicted_plan_cost_seconds": 878.5488351483204
+  },
+  {
+   "action_grid_tokens": 250,
+   "switch_frontiers": [
+    7500,
+    7500,
+    7750,
+    7500,
+    8250,
+    8250,
+    7250,
+    7500,
+    8250,
+    7500
+   ],
+   "switch_live_batches": [
+    15,
+    18,
+    16,
+    16,
+    23,
+    19,
+    12,
+    20,
+    18,
+    18
+   ],
+   "mean_initial_predicted_plan_cost_seconds": 874.7225853066482
+  }
+ ],
+ "rows": [
+  {
+   "action_grid_tokens": 1000,
+   "step": 1,
+   "is_warmup": true,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 877.9212945041645,
+   "switch_frontier": 7750,
+   "switch_live_batch": 22
+  },
+  {
+   "action_grid_tokens": 1000,
+   "step": 2,
+   "is_warmup": true,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 879.4901461145542,
+   "switch_frontier": 8000,
+   "switch_live_batch": 18
+  },
+  {
+   "action_grid_tokens": 1000,
+   "step": 3,
+   "is_warmup": true,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 879.4901461145542,
+   "switch_frontier": 8250,
+   "switch_live_batch": 15
+  },
+  {
+   "action_grid_tokens": 1000,
+   "step": 4,
+   "is_warmup": true,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 879.4901461145542,
+   "switch_frontier": 8500,
+   "switch_live_batch": 23
+  },
+  {
+   "action_grid_tokens": 1000,
+   "step": 5,
+   "is_warmup": true,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 879.4901461145542,
+   "switch_frontier": 7750,
+   "switch_live_batch": 19
+  },
+  {
+   "action_grid_tokens": 1000,
+   "step": 6,
+   "is_warmup": false,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 877.9212945041645,
+   "switch_frontier": 7500,
+   "switch_live_batch": 15
+  },
+  {
+   "action_grid_tokens": 1000,
+   "step": 7,
+   "is_warmup": false,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 877.9212945041645,
+   "switch_frontier": 7500,
+   "switch_live_batch": 18
+  },
+  {
+   "action_grid_tokens": 1000,
+   "step": 8,
+   "is_warmup": false,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 879.4901461145542,
+   "switch_frontier": 7750,
+   "switch_live_batch": 16
+  },
+  {
+   "action_grid_tokens": 1000,
+   "step": 9,
+   "is_warmup": false,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 879.4901461145542,
+   "switch_frontier": 7500,
+   "switch_live_batch": 16
+  },
+  {
+   "action_grid_tokens": 1000,
+   "step": 10,
+   "is_warmup": false,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 877.9212945041645,
+   "switch_frontier": 8500,
+   "switch_live_batch": 21
+  },
+  {
+   "action_grid_tokens": 1000,
+   "step": 11,
+   "is_warmup": false,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 879.4901461145542,
+   "switch_frontier": 8250,
+   "switch_live_batch": 19
+  },
+  {
+   "action_grid_tokens": 1000,
+   "step": 12,
+   "is_warmup": false,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 877.9212945041645,
+   "switch_frontier": 7250,
+   "switch_live_batch": 12
+  },
+  {
+   "action_grid_tokens": 1000,
+   "step": 13,
+   "is_warmup": false,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 877.9212945041645,
+   "switch_frontier": 7500,
+   "switch_live_batch": 20
+  },
+  {
+   "action_grid_tokens": 1000,
+   "step": 14,
+   "is_warmup": false,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 879.4901461145542,
+   "switch_frontier": 8250,
+   "switch_live_batch": 18
+  },
+  {
+   "action_grid_tokens": 1000,
+   "step": 15,
+   "is_warmup": false,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 877.9212945041645,
+   "switch_frontier": 7250,
+   "switch_live_batch": 18
+  },
+  {
+   "action_grid_tokens": 500,
+   "step": 1,
+   "is_warmup": true,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 877.9212945041645,
+   "switch_frontier": 7750,
+   "switch_live_batch": 22
+  },
+  {
+   "action_grid_tokens": 500,
+   "step": 2,
+   "is_warmup": true,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 879.4901461145542,
+   "switch_frontier": 7750,
+   "switch_live_batch": 19
+  },
+  {
+   "action_grid_tokens": 500,
+   "step": 3,
+   "is_warmup": true,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 879.4901461145542,
+   "switch_frontier": 8000,
+   "switch_live_batch": 15
+  },
+  {
+   "action_grid_tokens": 500,
+   "step": 4,
+   "is_warmup": true,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 879.4901461145542,
+   "switch_frontier": 8500,
+   "switch_live_batch": 23
+  },
+  {
+   "action_grid_tokens": 500,
+   "step": 5,
+   "is_warmup": true,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 879.4901461145542,
+   "switch_frontier": 7750,
+   "switch_live_batch": 19
+  },
+  {
+   "action_grid_tokens": 500,
+   "step": 6,
+   "is_warmup": false,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 877.9212945041645,
+   "switch_frontier": 7500,
+   "switch_live_batch": 15
+  },
+  {
+   "action_grid_tokens": 500,
+   "step": 7,
+   "is_warmup": false,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 877.9212945041645,
+   "switch_frontier": 7500,
+   "switch_live_batch": 18
+  },
+  {
+   "action_grid_tokens": 500,
+   "step": 8,
+   "is_warmup": false,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 879.4901461145542,
+   "switch_frontier": 7750,
+   "switch_live_batch": 16
+  },
+  {
+   "action_grid_tokens": 500,
+   "step": 9,
+   "is_warmup": false,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 879.4901461145542,
+   "switch_frontier": 7250,
+   "switch_live_batch": 20
+  },
+  {
+   "action_grid_tokens": 500,
+   "step": 10,
+   "is_warmup": false,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 877.9212945041645,
+   "switch_frontier": 8250,
+   "switch_live_batch": 23
+  },
+  {
+   "action_grid_tokens": 500,
+   "step": 11,
+   "is_warmup": false,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 879.4901461145542,
+   "switch_frontier": 8250,
+   "switch_live_batch": 19
+  },
+  {
+   "action_grid_tokens": 500,
+   "step": 12,
+   "is_warmup": false,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 877.9212945041645,
+   "switch_frontier": 7250,
+   "switch_live_batch": 12
+  },
+  {
+   "action_grid_tokens": 500,
+   "step": 13,
+   "is_warmup": false,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 877.9212945041645,
+   "switch_frontier": 7500,
+   "switch_live_batch": 20
+  },
+  {
+   "action_grid_tokens": 500,
+   "step": 14,
+   "is_warmup": false,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 879.4901461145542,
+   "switch_frontier": 8250,
+   "switch_live_batch": 18
+  },
+  {
+   "action_grid_tokens": 500,
+   "step": 15,
+   "is_warmup": false,
+   "initial_planned_frontier": 9250,
+   "initial_predicted_plan_cost_seconds": 877.9212945041645,
+   "switch_frontier": 7500,
+   "switch_live_batch": 18
+  },
+  {
+   "action_grid_tokens": 250,
+   "step": 1,
+   "is_warmup": true,
+   "initial_planned_frontier": 8500,
+   "initial_predicted_plan_cost_seconds": 874.0920472808805,
+   "switch_frontier": 8000,
+   "switch_live_batch": 21
+  },
+  {
+   "action_grid_tokens": 250,
+   "step": 2,
+   "is_warmup": true,
+   "initial_planned_frontier": 8500,
+   "initial_predicted_plan_cost_seconds": 875.6683923452996,
+   "switch_frontier": 8000,
+   "switch_live_batch": 18
+  },
+  {
+   "action_grid_tokens": 250,
+   "step": 3,
+   "is_warmup": true,
+   "initial_planned_frontier": 8500,
+   "initial_predicted_plan_cost_seconds": 875.6683923452996,
+   "switch_frontier": 8250,
+   "switch_live_batch": 15
+  },
+  {
+   "action_grid_tokens": 250,
+   "step": 4,
+   "is_warmup": true,
+   "initial_planned_frontier": 8500,
+   "initial_predicted_plan_cost_seconds": 875.6683923452996,
+   "switch_frontier": 8500,
+   "switch_live_batch": 23
+  },
+  {
+   "action_grid_tokens": 250,
+   "step": 5,
+   "is_warmup": true,
+   "initial_planned_frontier": 8500,
+   "initial_predicted_plan_cost_seconds": 875.6683923452996,
+   "switch_frontier": 8000,
+   "switch_live_batch": 18
+  },
+  {
+   "action_grid_tokens": 250,
+   "step": 6,
+   "is_warmup": false,
+   "initial_planned_frontier": 8500,
+   "initial_predicted_plan_cost_seconds": 874.0920472808805,
+   "switch_frontier": 7500,
+   "switch_live_batch": 15
+  },
+  {
+   "action_grid_tokens": 250,
+   "step": 7,
+   "is_warmup": false,
+   "initial_planned_frontier": 8500,
+   "initial_predicted_plan_cost_seconds": 874.0920472808805,
+   "switch_frontier": 7500,
+   "switch_live_batch": 18
+  },
+  {
+   "action_grid_tokens": 250,
+   "step": 8,
+   "is_warmup": false,
+   "initial_planned_frontier": 8500,
+   "initial_predicted_plan_cost_seconds": 875.6683923452996,
+   "switch_frontier": 7750,
+   "switch_live_batch": 16
+  },
+  {
+   "action_grid_tokens": 250,
+   "step": 9,
+   "is_warmup": false,
+   "initial_planned_frontier": 8500,
+   "initial_predicted_plan_cost_seconds": 875.6683923452996,
+   "switch_frontier": 7500,
+   "switch_live_batch": 16
+  },
+  {
+   "action_grid_tokens": 250,
+   "step": 10,
+   "is_warmup": false,
+   "initial_planned_frontier": 8500,
+   "initial_predicted_plan_cost_seconds": 874.0920472808805,
+   "switch_frontier": 8250,
+   "switch_live_batch": 23
+  },
+  {
+   "action_grid_tokens": 250,
+   "step": 11,
+   "is_warmup": false,
+   "initial_planned_frontier": 8500,
+   "initial_predicted_plan_cost_seconds": 875.6683923452996,
+   "switch_frontier": 8250,
+   "switch_live_batch": 19
+  },
+  {
+   "action_grid_tokens": 250,
+   "step": 12,
+   "is_warmup": false,
+   "initial_planned_frontier": 8500,
+   "initial_predicted_plan_cost_seconds": 874.0920472808805,
+   "switch_frontier": 7250,
+   "switch_live_batch": 12
+  },
+  {
+   "action_grid_tokens": 250,
+   "step": 13,
+   "is_warmup": false,
+   "initial_planned_frontier": 8500,
+   "initial_predicted_plan_cost_seconds": 874.0920472808805,
+   "switch_frontier": 7500,
+   "switch_live_batch": 20
+  },
+  {
+   "action_grid_tokens": 250,
+   "step": 14,
+   "is_warmup": false,
+   "initial_planned_frontier": 8500,
+   "initial_predicted_plan_cost_seconds": 875.6683923452996,
+   "switch_frontier": 8250,
+   "switch_live_batch": 18
+  },
+  {
+   "action_grid_tokens": 250,
+   "step": 15,
+   "is_warmup": false,
+   "initial_planned_frontier": 8500,
+   "initial_predicted_plan_cost_seconds": 874.0920472808805,
+   "switch_frontier": 7500,
+   "switch_live_batch": 18
+  }
+ ]
+}
