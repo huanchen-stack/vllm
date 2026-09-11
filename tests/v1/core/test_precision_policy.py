@@ -262,6 +262,14 @@ def test_degenerate_policy_round_trips_through_schema6_json(tmp_path):
     assert loaded.table == policy.table
     assert loaded.max_switch_live_batch == 4
     assert loaded.commitment_enabled is False  # no initial_rollout_batch given
+    # fixed_frontier emits the frontier (not the derived table) and reloads
+    # to an identical degenerate table.
+    fixed = load_precision_policy("fixed_frontier:8000")
+    payload = fixed.to_json()
+    assert payload["fixed_switch_frontier"] == 8000 and "lookup_table" not in payload
+    path.write_text(json.dumps(payload))
+    reloaded = load_precision_policy(str(path))
+    assert reloaded.kind == KIND_FIXED_FRONTIER and reloaded.table == fixed.table
 
 
 # ---------------------------------------------------------------------------

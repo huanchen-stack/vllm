@@ -864,8 +864,15 @@ class PrecisionPolicy:
             "calibration": {"kind": self.kind, "policy_revision": self.policy_revision},
         }
         if self.fixed_switch_frontier is not None:
+            # The table is derived from the frontier; emit the frontier and
+            # the span the loader needs to rebuild an identical table.
             payload["fixed_switch_frontier"] = self.fixed_switch_frontier
-        if self.table is not None:
+            if self.table is not None:
+                payload["offline_cost_model"] = {
+                    "response_cap": self.table.frontier_start
+                    + self.table.frontier_step * self.table.frontier_count
+                }
+        elif self.table is not None:
             payload["lookup_table"] = self.table.to_json()
         if self.cost_model is not None:
             payload["cost_model"] = self.cost_model.raw
