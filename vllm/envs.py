@@ -294,6 +294,7 @@ if TYPE_CHECKING:
     VLLM_DUAL_PRECISION_ONLINE_OBSERVATIONS: str = ""
     VLLM_DUAL_PRECISION_RELOAD_POLICY_EACH_ROLLOUT: bool = False
     VLLM_DUAL_PRECISION_REQUIRE_POLICY_ADVANCE: bool = False
+    VLLM_DUAL_PRECISION_REPREFILL: bool = False
 
 
 def get_default_cache_root():
@@ -2092,6 +2093,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (precision_scheduler.policy_barrier_timeout_s). Default off.
     "VLLM_DUAL_PRECISION_REQUIRE_POLICY_ADVANCE": lambda: bool(
         int(os.getenv("VLLM_DUAL_PRECISION_REQUIRE_POLICY_ADVANCE", "0"))
+    ),
+    # Re-prefill after the switch (default-off ablation): at the scheduler
+    # step on which the rollout precision switcher reports the BF16 -> INT4
+    # switch, preempt every surviving request so its KV is recomputed under
+    # the INT4 base (once per rollout, re-armed when the next rollout
+    # switches). Only honoured when VLLM_DUAL_PRECISION_POLICY produces a
+    # switch; requires prefix caching off and no KV / EC connector.
+    "VLLM_DUAL_PRECISION_REPREFILL": lambda: bool(
+        int(os.getenv("VLLM_DUAL_PRECISION_REPREFILL", "0"))
     ),
 }
 

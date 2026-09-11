@@ -178,3 +178,90 @@ the engine default; `resolve_sleep_level` in that module applies it at both
 * Bind call sites in `execute_model`, `_dummy_run` and CUDA-graph capture
   are C3/C4's; until they land the engine attaches the shadow but always
   serves BF16.
+
+## Re-prefill after the switch (component C7; default-off ablation)
+
+`VLLM_DUAL_PRECISION_REPREFILL=1` makes the scheduler preempt every surviving
+request at the step on which the switcher (C4, `docs/design/precision_switch.md`)
+reports the BF16 to INT4 switch, so the survivors' KV is recomputed under the
+INT4 base instead of continuing from KV produced by BF16. Default `0`; with
+every flag off the scheduler is vanilla. Code: `Scheduler.__init__`
+(`precision_reprefill_enabled`, `_validate_precision_reprefill_config`),
+`Scheduler._maybe_trigger_precision_reprefill`, `Request.precision_reprefill_done`
+/ `precision_reprefill_output_offset`; tests `tests/v1/core/test_precision_reprefill.py`
+(CPU) and `tests/v1/core/test_precision_reprefill_gpu.py` (gpu-smoke).
+
+Mechanism. `schedule()` ticks the switcher, then, when re-prefill is on and
+`switcher.last_switch` belongs to a rollout that has not been re-prefilled
+yet, runs the trigger before the running loop: every running request that
+has computed tokens and has not been re-prefilled is preempted through the
+vanilla `_preempt_request` in reverse order (FCFS is preserved because
+preemption prepends to the waiting queue), `precision_reprefill_done` is
+set, the response length at the boundary is recorded in
+`precision_reprefill_output_offset`, in-flight async output placeholders are
+discarded exactly as `reset_prefix_cache(reset_running_requests=True)` does
+(`async_tokens_to_discard = num_output_placeholders; num_output_placeholders = 0`),
+waiting requests are marked done, and `prev_step_scheduled_req_ids` is cleared
+so the model runner rebuilds the survivors as resumed requests. Because the
+preempted list is populated before the running loop, the switching step is
+an *idle engine step* (`total_num_scheduled_tokens == 0`) and the survivors
+resume as prefill under the INT4 precision on the next step. The archived
+evidence was produced with these idle-step semantics, which is why the
+trigger was kept as a copy instead of being folded into a shared
+preempt-all helper. Two log lines keep their archived format:
+`Dual precision re-prefill request <id>: generated_tokens=%d, total_reprefill_tokens=%d`
+per survivor and `Dual precision re-prefill triggered: rollout_index=%d,
+committed_frontier=%d, applied_response_tokens=%d, unfinished_requests=%d,
+preempted_requests=%d, total_reprefill_tokens=%d` (the experimental line
+carried `threshold=` instead of the rollout/frontier fields).
+
+Once per rollout, re-armed on drain. The idempotence key is the switch
+event's `rollout_index`: the trigger fires at most once per switch, and the
+switcher produces at most one switch per rollout. A drained scheduler ends
+the rollout in the switcher (cohort-free specs) and the next batch arms a
+new rollout with a new index, so a long-lived rollout engine re-prefills
+once per batch; back-to-back cohort rollouts (a new cohort admitted before
+the scheduler ever looked empty) get a new index too. A request that was
+already re-prefilled in an earlier rollout and is still running is skipped
+(the per-request latch), as in the experimental code. Any policy kind that
+switches triggers it (`fixed_threshold`, `fixed_frontier`, EMA tables);
+`uniform_w4` never reports a switch and never re-prefills, and the flag is
+ignored with a warning when no policy is configured. Construction fails with
+prefix caching (block hashes do not encode precision), KV connectors or EC
+connectors.
+
+Knobs.
+
+| env (vllm/envs.py) | default | meaning |
+|---|---|---|
+| `VLLM_DUAL_PRECISION_REPREFILL` | `0` | preempt every survivor at the rollout's switch so its KV is recomputed under INT4; honoured only when `VLLM_DUAL_PRECISION_POLICY` produces a switch |
+
+Dropped from the experimental tree (decision 5): `VLLM_REPREFILL_ONLY_ROLLOUT`
+(a second gate that ran the trigger without INT4; one archived one-step run),
+the separate threshold latch inside the trigger (the switch event is the
+single source of the precision signal now), the `num_visible_output_tokens`
+fold branch and the `check_stop` change that used it (dead in every code
+path: output tokens survive preemption, so `num_output_tokens` keeps counting
+from the pre-switch length and `max_tokens` is unaffected; the branch was
+also non-monotone once the post-fold length passed the offset). The
+`reprefill_done` / `reprefill_output_offset` fields are kept under the
+`precision_reprefill_*` names; the offset is informational.
+
+Evidence. The NLL study behind the default-off decision lives in verl
+(`examples/precision_scheduler/analysis/reprefill_nll_study/README.md`):
+on 16 Qwen3.5-9B long-tail traces with fake INT4, continuing from the BF16
+state is *closer* to BF16 than re-prefilling under INT4 at every window
+offset (dNLL reuse-reprefill -0.064 / -0.030 / -0.032 / -0.045 / -0.042
+nats at offsets 0 / 512 / 1024 / 2048 / 4096, CI95 entirely negative;
+KL-to-BF16 0.040 vs 0.097 at offset 0). The archived threshold studies
+(`temporal_guard_120`, 72 completed runs; the `tail-k*-reprefill` natural
+policies; the 27B `mixed_precision_reprefill` rollouts) ran with re-prefill
+ON under the experimental scheduler; the later no-reprefill studies and every
+headline dynamic-policy run ran with it OFF. GPU smoke (2026-09-11, GPU 2,
+Qwen3.5-4B, `fixed_frontier:32`, two batches of eight greedy prompts, 128
+tokens, eager; residency not enabled, so the preempt/recompute path is what
+is exercised): one trigger per batch, `preempted_requests=8` ==
+`unfinished_requests=8`, `num_preemptions == 1`, idle trigger step, both
+batches identical, pre-switch tokens bit-identical to an uninterrupted run
+on the same engine and 7/8 sequences identical over all 128 tokens (token
+agreement 0.94).

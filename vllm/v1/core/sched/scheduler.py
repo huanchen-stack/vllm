@@ -119,6 +119,22 @@ class Scheduler(SchedulerInterface):
                 require_advance=envs.VLLM_DUAL_PRECISION_REQUIRE_POLICY_ADVANCE,
                 observations_path=envs.VLLM_DUAL_PRECISION_ONLINE_OBSERVATIONS,
             )
+        # Re-prefill after the switch (default-off ablation): preempt every
+        # survivor at the step on which the switcher reports the switch so its
+        # KV is recomputed under INT4. Honoured only when a switcher exists.
+        self.precision_reprefill_enabled = False
+        if envs.VLLM_DUAL_PRECISION_REPREFILL:
+            if self.precision_switcher is None:
+                logger.warning(
+                    "VLLM_DUAL_PRECISION_REPREFILL=1 ignored: no "
+                    "VLLM_DUAL_PRECISION_POLICY, so no switch can occur."
+                )
+            else:
+                self.precision_reprefill_enabled = True
+                self._validate_precision_reprefill_config()
+        # Rollout index of the switch the last re-prefill consumed (0 = none):
+        # exactly one re-prefill per rollout switch.
+        self._precision_reprefill_rollout_index = 0
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -390,6 +406,14 @@ class Scheduler(SchedulerInterface):
         base_precision: str | None = None
         if self.precision_switcher is not None:
             base_precision = self.precision_switcher.tick(self._precision_step())
+            if self.precision_reprefill_enabled:
+                # Populating preempted_reqs here makes the switching step an
+                # idle engine step: the running loop below sees an empty list
+                # and the waiting loop is skipped after a preemption, so the
+                # survivors resume (prefill under INT4) on the next step.
+                preempted_reqs.extend(
+                    self._maybe_trigger_precision_reprefill(scheduled_timestamp)
+                )
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -1919,6 +1943,107 @@ class Scheduler(SchedulerInterface):
 
     def set_pause_state(self, pause_state: PauseState) -> None:
         self._pause_state = pause_state
+
+    def _validate_precision_reprefill_config(self) -> None:
+        """Re-prefill recomputes KV under a different base precision, which
+        the block hashes do not encode and no connector can be told about."""
+        if self.vllm_config.kv_transfer_config is not None:
+            raise ValueError(
+                "VLLM_DUAL_PRECISION_REPREFILL does not support KV connectors yet."
+            )
+        if self.vllm_config.ec_transfer_config is not None:
+            raise ValueError(
+                "VLLM_DUAL_PRECISION_REPREFILL does not support EC connectors yet."
+            )
+        if self.cache_config.enable_prefix_caching:
+            raise ValueError(
+                "VLLM_DUAL_PRECISION_REPREFILL requires prefix caching to be "
+                "disabled because cache block hashes do not encode base precision."
+            )
+
+    @property
+    def precision_reprefill_triggered(self) -> bool:
+        """True once the current rollout's switch has been re-prefilled."""
+        switcher = self.precision_switcher
+        if switcher is None or switcher.last_switch is None:
+            return False
+        return (
+            switcher.last_switch.rollout_index
+            == self._precision_reprefill_rollout_index
+        )
+
+    def _maybe_trigger_precision_reprefill(self, timestamp: float) -> list[Request]:
+        """Preempt every surviving request at the step the switcher reports a
+        switch, exactly once per rollout (the switch event's rollout index is
+        the idempotence key; a drained scheduler ends the rollout in the
+        switcher, so the next batch re-arms).  Semantics of the archived
+        trigger: survivors are preempted in reverse order so FCFS is
+        preserved, requests that never computed anything and requests already
+        re-prefilled stay running, waiting requests are marked done, and
+        in-flight async output placeholders are discarded exactly like
+        ``reset_prefix_cache(reset_running_requests=True)``."""
+        switcher = self.precision_switcher
+        assert switcher is not None
+        unfinished = self.get_num_unfinished_requests()
+        if unfinished == 0:
+            return []
+        switch = switcher.last_switch
+        if switch is None or self.precision_reprefill_triggered:
+            return []
+        self._precision_reprefill_rollout_index = switch.rollout_index
+
+        preempted: list[Request] = []
+        total_reprefill_tokens = 0
+        running_reqs = self.running
+        self.running = []
+        for request in reversed(running_reqs):
+            if request.precision_reprefill_done:
+                self.running.insert(0, request)
+                continue
+            request.precision_reprefill_done = True
+            if request.num_computed_tokens == 0:
+                self.running.insert(0, request)
+                continue
+            generated_tokens = request.num_output_tokens
+            request.precision_reprefill_output_offset = max(
+                request.precision_reprefill_output_offset, generated_tokens
+            )
+            total_tokens = request.num_tokens
+            total_reprefill_tokens += total_tokens
+            self._preempt_request(request, timestamp)
+            # Async scheduling: output frames already in flight are stale and
+            # must be discarded when they return (vanilla reset_prefix_cache).
+            request.async_tokens_to_discard = request.num_output_placeholders
+            request.num_output_placeholders = 0
+            preempted.append(request)
+            logger.info(
+                "Dual precision re-prefill request %s: generated_tokens=%d, "
+                "total_reprefill_tokens=%d",
+                request.request_id,
+                generated_tokens,
+                total_tokens,
+            )
+
+        for request in itertools.chain(self.waiting, self.skipped_waiting):
+            request.precision_reprefill_done = True
+
+        if preempted:
+            # Forced preemption + resumption: the model runner must treat the
+            # survivors as not scheduled in the prior step.
+            self.prev_step_scheduled_req_ids.clear()
+        logger.info(
+            "Dual precision re-prefill triggered: rollout_index=%d, "
+            "committed_frontier=%d, applied_response_tokens=%d, "
+            "unfinished_requests=%d, preempted_requests=%d, "
+            "total_reprefill_tokens=%d",
+            switch.rollout_index,
+            switch.committed_frontier,
+            switch.applied_response_tokens,
+            unfinished,
+            len(preempted),
+            total_reprefill_tokens,
+        )
+        return preempted
 
     def _precision_step(self) -> SchedulerStep:
         """Snapshot of the live requests for the precision switcher."""
