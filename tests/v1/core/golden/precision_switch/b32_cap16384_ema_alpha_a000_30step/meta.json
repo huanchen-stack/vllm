@@ -1,0 +1,8 @@
+{
+  "batch": 32,
+  "rollouts": 30,
+  "switches": 29,
+  "run": "/data/huanchen/verl/.codex-report/new-storyline-experiments/dynamic_tail8k_heatmap_20260823/runs/b32_cap16384_ema_alpha_a000_30step",
+  "policy": "/data/huanchen/verl/.codex-report/new-storyline-experiments/dynamic_tail8k_heatmap_20260823/policies/b32_cap16384_ema_alpha_a000_30step.json",
+  "trace": "/data/huanchen/verl/.codex-report/new-storyline-experiments/dynamic_tail8k_heatmap_20260823/runs/b32_cap16384_ema_alpha_a000_30step/traces/request_lifetimes_replica000_node000.jsonl"
+}

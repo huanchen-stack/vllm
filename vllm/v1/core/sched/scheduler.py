@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -42,6 +43,11 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.precision_switch import (
+    LiveRequest,
+    RolloutPrecisionSwitcher,
+    SchedulerStep,
+)
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -62,6 +68,10 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    # Class-level default so the precision hooks are inert on instances built
+    # without __init__ (tests) as well as when no policy is configured.
+    precision_switcher: RolloutPrecisionSwitcher | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -98,6 +108,16 @@ class Scheduler(SchedulerInterface):
             defaultdict(set) if include_finished_set else None
         )
         self.prev_step_scheduled_req_ids: set[str] = set()
+        # Rollout precision switcher (BF16 -> INT4 once per rollout). Only
+        # constructed when VLLM_DUAL_PRECISION_POLICY is set; every hook below
+        # is a no-op otherwise and SchedulerOutput.dual_precision_base_precision
+        # stays None.
+        if envs.VLLM_DUAL_PRECISION_POLICY:
+            self.precision_switcher = RolloutPrecisionSwitcher.from_settings(
+                envs.VLLM_DUAL_PRECISION_POLICY,
+                reload_each_rollout=envs.VLLM_DUAL_PRECISION_RELOAD_POLICY_EACH_ROLLOUT,
+                observations_path=envs.VLLM_DUAL_PRECISION_ONLINE_OBSERVATIONS,
+            )
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -365,6 +385,10 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+
+        base_precision: str | None = None
+        if self.precision_switcher is not None:
+            base_precision = self.precision_switcher.tick(self._precision_step())
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -906,6 +930,8 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            num_unfinished_requests=self.get_num_unfinished_requests(),
+            dual_precision_base_precision=base_precision,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1011,6 +1037,8 @@ class Scheduler(SchedulerInterface):
         kept_output_tokens = session._all_token_ids[
             session.num_prompt_tokens : num_computed_tokens
         ]
+        # Folded output stays response progress for the precision switcher.
+        session.streaming_output_token_offset += len(kept_output_tokens)
         del session._all_token_ids[num_computed_tokens:]
         session._output_token_ids.clear()
         assert session.prompt_token_ids is not None
@@ -1668,6 +1696,13 @@ class Scheduler(SchedulerInterface):
             if stopped:
                 del new_token_ids[num_new:]  # Trim new tokens if needed.
                 break
+        if self.precision_switcher is not None:
+            # Advance the rollout watermark while the request still exists:
+            # a request can cross a switching frontier on its final token and
+            # be freed before the next schedule() call.
+            self.precision_switcher.on_request_output(
+                request.request_id, request.num_cumulative_output_tokens
+            )
         return new_token_ids, stopped
 
     def _free_encoder_inputs(self, request: Request) -> None:
@@ -1777,6 +1812,8 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            if self.precision_switcher is not None:
+                self.precision_switcher.on_new_request(request.request_id)
             if self.connector is not None:
                 self.connector.on_new_request(request)
             if self.log_stats:
@@ -1854,6 +1891,10 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
+        if self.precision_switcher is not None:
+            self.precision_switcher.on_request_finished(
+                request_id, request.num_cumulative_output_tokens
+            )
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
@@ -1874,6 +1915,20 @@ class Scheduler(SchedulerInterface):
 
     def set_pause_state(self, pause_state: PauseState) -> None:
         self._pause_state = pause_state
+
+    def _precision_step(self) -> SchedulerStep:
+        """Snapshot of the live requests for the precision switcher."""
+        live = [
+            LiveRequest(
+                request_id=request.request_id,
+                prompt_tokens=request.num_prompt_tokens,
+                output_tokens=request.num_cumulative_output_tokens,
+            )
+            for request in self.requests.values()
+            if not request.is_finished()
+            and request.status != RequestStatus.WAITING_FOR_STREAMING_REQ
+        ]
+        return SchedulerStep(live=live, unfinished=self.get_num_unfinished_requests())
 
     def get_num_unfinished_requests(self) -> int:
         if self._pause_state == PauseState.PAUSED_ALL:
