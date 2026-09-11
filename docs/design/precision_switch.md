@@ -219,9 +219,12 @@ Policy JSON fields the runtime honours: `scan_interval_tokens`,
   knob) refuses to run on a stale revision.
 - **C8 verl harness**: `precision_scheduler.policy_barrier_timeout_s` waits
   for the calibrator's revision before submitting the next rollout.
-- **C7 re-prefill**: hooks after this component; it will move the response
-  length to `num_visible_output_tokens` (re-prefill folds output into the
-  prompt) by changing `Request.num_cumulative_output_tokens` only.
+- **C7 re-prefill** (`VLLM_DUAL_PRECISION_REPREFILL`, default off): reads
+  `switcher.last_switch` right after `tick` in `schedule()` and preempts every
+  survivor once per switch event (rollout index as the key). It does not
+  change the response-length accounting: output tokens survive preemption,
+  so `num_cumulative_output_tokens` is unaffected. See
+  `dual_precision_residency.md`, "Re-prefill after the switch".
 - **verl** `build_static_policy.py --kind frontier|live_threshold|forced_switch`
   builds the file-based baselines (cohort arming with explicit B); byte-equal
   to the archived `fixed_k*`, `fixed_t*`, `*_fixed_frontier*_30step` and
