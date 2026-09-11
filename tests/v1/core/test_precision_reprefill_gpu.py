@@ -40,7 +40,7 @@ MAX_TOKENS = 128
 
 
 @pytest.mark.gpu_smoke
-def test_reprefill_fires_once_per_batch_on_a_real_engine(request, tmp_path: Path):
+def test_reprefill_fires_once_per_batch_on_a_real_engine(request, tmp_path: Path, monkeypatch):
     markexpr = request.config.getoption("-m", default="") or ""
     if "gpu_smoke" not in markexpr and os.environ.get("PS_RUN_GPU_SMOKE") != "1":
         pytest.skip("gpu_smoke tier: run with -m gpu_smoke under run_gpu.sh")
@@ -53,11 +53,11 @@ def test_reprefill_fires_once_per_batch_on_a_real_engine(request, tmp_path: Path
     if not Path(model).exists():
         pytest.skip(f"checkpoint not found: {model}")
 
-    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    os.environ["VLLM_DUAL_PRECISION_POLICY"] = f"fixed_frontier:{FRONTIER}"
-    os.environ["VLLM_DUAL_PRECISION_REPREFILL"] = "1"
-    os.environ["VLLM_DUAL_PRECISION_ONLINE_OBSERVATIONS"] = ""
-    os.environ["VLLM_DUAL_PRECISION_RELOAD_POLICY_EACH_ROLLOUT"] = "0"
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv("VLLM_DUAL_PRECISION_POLICY", f"fixed_frontier:{FRONTIER}")
+    monkeypatch.setenv("VLLM_DUAL_PRECISION_REPREFILL", "1")
+    monkeypatch.setenv("VLLM_DUAL_PRECISION_ONLINE_OBSERVATIONS", "")
+    monkeypatch.setenv("VLLM_DUAL_PRECISION_RELOAD_POLICY_EACH_ROLLOUT", "0")
 
     from vllm import LLM, SamplingParams
     from vllm.v1.core.sched.scheduler import Scheduler
