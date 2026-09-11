@@ -50,13 +50,16 @@ Inert unless such a checkpoint is loaded.
   checkpoints store a raw-patch projection under that prefix.
 - YOCO KV-shared layers (the last `num_kv_shared_layers`: 20 for E2B, 18 for
   E4B, 0 for 12B/31B) carry no `k_norm` in the official checkpoints because
-  their K/V come from an earlier layer. `Gemma4Attention` keeps the module for a
-  uniform implementation but never evaluates it when `is_kv_shared_layer`, so
-  `load_weights` marks `model.layers.{i}.self_attn.k_norm.weight` for those
-  layers as loaded to satisfy the loader's completeness check. This also fixes
-  vanilla E2B/E4B loads through the multimodal wrapper (it delegates to the same
-  method). `tests/models/test_gemma4_unified_config.py` asserts the invariant by
-  making `k_norm.forward` raise on a KV-shared layer.
+  their K/V come from an earlier layer. Vanilla `Gemma4ForConditionalGeneration`
+  could not load the official E2B checkpoint at all (`ValueError: Following
+  weights were not initialized from checkpoint` for
+  `model.layers.15..34.self_attn.k_norm.weight`); this is not a behavior change
+  but a load fix. `Gemma4Attention` keeps the module for a uniform
+  implementation and never evaluates it when `is_kv_shared_layer`, so
+  `load_weights` marks those never-read parameters as loaded. The multimodal
+  wrapper delegates to the same method, so it is fixed too.
+  `tests/models/test_gemma4_unified_config.py` asserts the invariant by making
+  `k_norm.forward` raise on a KV-shared layer.
 
 ### 3. Marlin input padding (`VLLM_MARLIN_INPUT_PADDING`)
 
@@ -121,6 +124,11 @@ environment).
 - Nemotron padded Marlin vs Triton, GPU 5, 2026-09-11: cosine 1.0,
   max_abs 0.03125, relative_rmse 2.856e-4 — identical to the archived oracle
   `/data/huanchen/verl/.codex-report/new-storyline-experiments/eos_hazard_extensibility/manifests/nemotron_padded_marlin_numerical_validation.json`.
+- The verl-side FFPA gpu-smoke test
+  (`verl/tests/models/test_gemma4_ffpa_dense_on_gpu.py`) passes only with the
+  archived `ffpa_attn` site
+  (`/data/huanchen/verl/.codex-report/new-storyline-experiments/eos_hazard_extensibility/tools/ffpa_site`)
+  on `PYTHONPATH`; without `ffpa_attn` importable it skips.
 - Gemma-4 E2B (`google/gemma-4-E2B-it-qat-q4_0-unquantized`) loads through
   `Gemma4ForCausalLM` (via `hf_overrides={"architectures": ["Gemma4ForCausalLM"]}`)
   in 15.8 s on GPU 5 and produces the same greedy continuation as the
