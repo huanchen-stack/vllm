@@ -15,7 +15,8 @@ Two further checks are off by default and gated by registered env vars:
 * ``VLLM_DUAL_PRECISION_VALIDATE_SHADOW``: at attach time, compare every
   attached INT4 linear with its BF16 twin on one random input and log the
   worst cosine / relative RMSE (a mis-matched or mis-packed shadow shows up
-  as a cosine far below 0.9).
+  as a cosine far below 0.9). With dummy base weights it is deferred to the
+  same point as the sanity probe, so it compares against real weights.
 * ``VLLM_DUAL_PRECISION_VALIDATE_LIFECYCLE``: at attach time, record
   fixed-input probes for the first attached INT4 linears; at the first INT4
   bind re-run them as the baseline, and re-run them again at the first INT4
@@ -105,12 +106,15 @@ def sanity_probe_shadow(
     *,
     shadow_load_format: str,
     when: str,
+    deferred: bool = False,
 ) -> ShadowValidation:
     """Always-on guard: one random input through one attached layer, both
     bases; raise unless the INT4 output tracks the BF16 one.
 
     ``when`` names the moment for the log/error ("at attach", "at the first
-    INT4 bind after load_weights").
+    INT4 bind after load_weights"). A ``deferred`` probe (dummy engine, run
+    after the base sync) logs its success at WARNING so verl's default WARN
+    log carries the positive evidence; the attach-time success stays INFO.
     """
     result = compare_shadow_numerics(name, bf16_layer, int4_layer, dtype)
     if not result.cosine > SANITY_MIN_COSINE:  # NaN fails too
@@ -122,7 +126,7 @@ def sanity_probe_shadow(
             "The shadow does not match the base model (dummy-loaded, "
             "mis-packed or the wrong checkpoint); refusing to serve it."
         )
-    logger.info(
+    (logger.warning if deferred else logger.info)(
         "Dual precision INT4 shadow sanity probe passed %s: layer %s "
         "cos=%.4f rel_rmse=%.4f (shadow load_format=%s).",
         when,
@@ -134,12 +138,15 @@ def sanity_probe_shadow(
     return result
 
 
-def log_shadow_validation(results: list[ShadowValidation], worst_k: int = 10) -> None:
+def log_shadow_validation(
+    results: list[ShadowValidation], worst_k: int = 10, when: str = "at attach"
+) -> None:
     if not results:
         return
     worst = sorted(results, key=lambda item: item.cosine)[:worst_k]
     logger.warning(
-        "Dual precision shadow numerical validation (worst cosine): %s",
+        "Dual precision shadow numerical validation %s (worst cosine): %s",
+        when,
         "; ".join(
             f"{item.name}: cos={item.cosine:.6f}, rel_rmse={item.relative_rmse:.6f}"
             for item in worst

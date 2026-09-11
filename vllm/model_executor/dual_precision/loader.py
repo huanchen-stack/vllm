@@ -412,17 +412,17 @@ def attach_shadow_layers(
 
     # Always-on sanity probe on the first attached layer, still before any
     # override is installed so a failure leaves the model untouched.
-    sanity_probe_pending = False
+    deferred = str(engine_load_format).lower() == "dummy"
     first_name, first_wrapper, first_int4 = next(
         item for item in plan if item[2] is not None
     )
-    if str(engine_load_format).lower() == "dummy":
-        sanity_probe_pending = True
+    if deferred:
         logger.warning(
             "Dual precision: engine load_format=dummy, so the INT4 shadow "
-            "sanity probe on %s is deferred to the first INT4 bind after the "
+            "sanity probe on %s%s is deferred to the first INT4 bind after the "
             "base weights are loaded.",
             first_name,
+            " (and the numerical shadow validation)" if validate_shadow else "",
         )
     else:
         sanity_probe_shadow(
@@ -442,7 +442,7 @@ def attach_shadow_layers(
         layer_index = transformer_layer_index(name)
         if int4_layer is not None:
             attached_layers.append((name, int4_layer))
-            if validate_shadow:
+            if validate_shadow and not deferred:
                 validations.append(
                     compare_shadow_numerics(name, wrapper.base_layer, int4_layer, dtype)
                 )
@@ -467,7 +467,8 @@ def attach_shadow_layers(
         lifecycle_probes=probes,
         probe_dtype=dtype,
         shadow_load_format=str(shadow_load_format),
-        sanity_probe_pending=sanity_probe_pending,
+        sanity_probe_pending=deferred,
+        shadow_validation_pending=deferred and validate_shadow,
     )
     set_dual_precision_state(model, state)
     register_shadow_store(model, store)

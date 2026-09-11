@@ -90,6 +90,8 @@ class DualPrecisionState:
     sanity_probe_pending: bool = False
     """The attach-time sanity probe was deferred (dummy base weights): run it
     at the first INT4 bind after a weight-load event."""
+    shadow_validation_pending: bool = False
+    """``VLLM_DUAL_PRECISION_VALIDATE_SHADOW`` deferred the same way."""
     bound_state_key: tuple[Any, ...] | None = None
     logged_bind_keys: set[tuple[Any, ...]] = field(default_factory=set)
 
@@ -270,6 +272,8 @@ def _run_int4_bind_validations(state: DualPrecisionState) -> None:
     """Lifecycle probes (baseline at the first INT4 bind, again after every
     marked event) and the deferred sanity probe, before the wrappers flip."""
     from vllm.model_executor.dual_precision.validation import (
+        compare_shadow_numerics,
+        log_shadow_validation,
         sanity_probe_shadow,
         validate_shadow_lifecycle,
     )
@@ -281,18 +285,34 @@ def _run_int4_bind_validations(state: DualPrecisionState) -> None:
     elif events:
         validate_shadow_lifecycle(state, after=events)
     weight_events = [kind for kind in events if kind in LIFECYCLE_WEIGHT_EVENTS]
-    if state.sanity_probe_pending and weight_events:
+    if not weight_events or state.probe_dtype is None:
+        return
+    when = "at the first INT4 bind after " + ",".join(weight_events)
+    shadow_bindings = [b for b in state.bindings if b.shadow_active]
+    if state.sanity_probe_pending:
         state.sanity_probe_pending = False
-        first = next((b for b in state.bindings if b.shadow_active), None)
-        if first is not None and state.probe_dtype is not None:
+        if shadow_bindings:
+            first = shadow_bindings[0]
             sanity_probe_shadow(
                 first.module_name,
                 first.bf16,
                 first.int4_or_fallback,
                 state.probe_dtype,
                 shadow_load_format=state.shadow_load_format,
-                when="at the first INT4 bind after " + ",".join(weight_events),
+                when=when,
+                deferred=True,
             )
+    if state.shadow_validation_pending:
+        state.shadow_validation_pending = False
+        log_shadow_validation(
+            [
+                compare_shadow_numerics(
+                    b.module_name, b.bf16, b.int4_or_fallback, state.probe_dtype
+                )
+                for b in shadow_bindings
+            ],
+            when=when,
+        )
 
 
 def bind_dual_precision(
@@ -321,6 +341,7 @@ def bind_dual_precision(
         not state.lifecycle_validated
         or state.pending_lifecycle_events
         or state.sanity_probe_pending
+        or state.shadow_validation_pending
     ):
         _run_int4_bind_validations(state)
 

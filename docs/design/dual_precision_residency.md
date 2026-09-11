@@ -88,10 +88,14 @@ this component only makes both bases available and switchable.
    installed; when the engine loaded dummy base weights (verl syncs the
    trainer's weights later) the BF16 twin is noise, so the probe is deferred
    to the first INT4 bind after the first weight-load lifecycle event
-   (`sanity_probe_pending` on the state). Two further checks are off by
-   default: `VLLM_DUAL_PRECISION_VALIDATE_SHADOW=1` compares every attached
-   INT4 linear with its BF16 twin on a random input and logs the ten worst
-   cosines. `VLLM_DUAL_PRECISION_VALIDATE_LIFECYCLE=1` records fixed-input
+   (`sanity_probe_pending` on the state); a deferred probe logs its success
+   at WARNING so verl's default WARN log carries the positive evidence (the
+   attach-time success stays INFO). Two further checks are off by default:
+   `VLLM_DUAL_PRECISION_VALIDATE_SHADOW=1` compares every attached INT4
+   linear with its BF16 twin on a random input and logs the ten worst
+   cosines, deferred to the same point on a dummy engine
+   (`shadow_validation_pending`) so it never scores the shadow against
+   random base weights. `VLLM_DUAL_PRECISION_VALIDATE_LIFECYCLE=1` records fixed-input
    probes for the first six attached linears at load, re-runs them at the
    first INT4 bind (the baseline, which under a server is the CUDA-graph
    capture during init) and again at the first INT4 bind after every

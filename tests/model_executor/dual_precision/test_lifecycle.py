@@ -90,10 +90,18 @@ def test_random_shadow_is_refused_at_attach_and_leaves_model_untouched():
     assert all(model.get_submodule(n).base_forward_override is None for n in NAMES)
 
 
-def test_sanity_probe_passes_for_a_correlated_shadow_and_is_not_deferred():
-    _, state, _ = _attach()
+def test_sanity_probe_passes_for_a_correlated_shadow_and_is_not_deferred(caplog):
+    with caplog.at_level(logging.INFO, logger=VALIDATION_LOGGER):
+        _, state, _ = _attach(validate_shadow=True)
     assert state.sanity_probe_pending is False
+    assert state.shadow_validation_pending is False
     assert state.shadow_load_format == "auto"
+    # Attach-time success stays INFO; the numerical validation ran at attach.
+    passed = [
+        r for r in caplog.records if "sanity probe passed at attach" in r.getMessage()
+    ]
+    assert len(passed) == 1 and passed[0].levelno == logging.INFO
+    assert "numerical validation at attach (worst cosine)" in caplog.text
 
 
 def test_dummy_engine_defers_sanity_probe_to_first_int4_bind_after_load_weights(
