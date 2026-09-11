@@ -145,10 +145,12 @@ def _lifecycle_after_weight_sync(model) -> dict:
     """Runs inside the worker after sleep(1)/wake_up: replay verl's weight-sync
     post-processing with and without the shadow hidden, then probe."""
     from vllm.model_executor.dual_precision import (
+        BASE_PRECISION_BF16,
         BASE_PRECISION_INT4,
         SHADOW_MODULE_NAME,
         bind_dual_precision,
         get_dual_precision_state,
+        mark_lifecycle_event,
     )
     from vllm.model_executor.dual_precision.validation import run_lifecycle_probes
     from vllm.model_executor.model_loader.utils import process_weights_after_loading
@@ -158,13 +160,25 @@ def _lifecycle_after_weight_sync(model) -> dict:
     # process_weights_after_loading only reads dtype/quantization from it.
     model_config = SimpleNamespace(dtype=torch.bfloat16, quantization=None)
 
+    # The worker marked the sleep/wake-up; the first INT4 bind is the baseline
+    # validation and consumes them.
+    events_after_wake = list(state.pending_lifecycle_events)
+    bind_dual_precision(model, BASE_PRECISION_INT4)
+    events_after_baseline = list(state.pending_lifecycle_events)
+    bind_dual_precision(model, BASE_PRECISION_BF16)
+
     # verl's _hide_dual_precision_shadow_model: pop the store around the call.
     shadow = model._modules.pop(SHADOW_MODULE_NAME)
     try:
         process_weights_after_loading(model, model_config, device)
     finally:
         model._modules[SHADOW_MODULE_NAME] = shadow
-    bind_dual_precision(model, BASE_PRECISION_INT4)  # first INT4 bind -> validation
+    # verl streams the base weights through model.load_weights (wrapped at
+    # attach to mark the event); arm the re-validation the same way.
+    load_weights_wrapped = "load_weights" in model.__dict__
+    mark_lifecycle_event(model, "load_weights")
+    bind_dual_precision(model, BASE_PRECISION_INT4)  # re-validation after sync
+    events_after_sync_bind = list(state.pending_lifecycle_events)
     with_hide = [
         (r.name, r.exact, r.max_abs)
         for r in run_lifecycle_probes(state.lifecycle_probes)
@@ -186,6 +200,11 @@ def _lifecycle_after_weight_sync(model) -> dict:
     return {
         "num_probes": len(state.lifecycle_probes),
         "validated": state.lifecycle_validated,
+        "sanity_probe_pending": state.sanity_probe_pending,
+        "events_after_wake": events_after_wake,
+        "events_after_baseline": events_after_baseline,
+        "events_after_sync_bind": events_after_sync_bind,
+        "load_weights_wrapped": load_weights_wrapped,
         "with_hide": with_hide,
         "without_hide": without_hide,
         "without_hide_error": without_hide_error,
@@ -199,6 +218,14 @@ def test_lifecycle_probes_exact_after_sleep_wake_and_weight_sync(llm):
     (report,) = llm.apply_model(_lifecycle_after_weight_sync)
 
     assert report["num_probes"] == 6 and report["validated"]
+    # The engine loaded real base weights, so the sanity probe ran at attach.
+    assert report["sanity_probe_pending"] is False
+    # Defect 4: the worker's sleep/wake_up armed a re-validation, the bind
+    # consumed it, and the weight-sync mark armed another one.
+    assert report["events_after_wake"] == ["sleep", "wake_up"], report
+    assert report["events_after_baseline"] == []
+    assert report["events_after_sync_bind"] == []
+    assert report["load_weights_wrapped"] is True
     assert all(exact and max_abs == 0 for _, exact, max_abs in report["with_hide"]), (
         report
     )

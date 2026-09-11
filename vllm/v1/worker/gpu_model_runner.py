@@ -60,6 +60,7 @@ from vllm.model_executor.dual_precision import (
     attach_dual_precision,
     bind_dual_precision,
     dual_precision_rollout_enabled,
+    mark_lifecycle_event,
 )
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -5308,6 +5309,7 @@ class GPUModelRunner(
         model = self.get_model()
         weights_to_load = {name for name, _ in model.named_parameters()}
         counter_before_reloading = time.perf_counter()
+        self.mark_dual_precision_lifecycle_event("reload_weights")
 
         # load weights from disk if none are provided
         if weights_iterator is None:
@@ -6525,6 +6527,17 @@ class GPUModelRunner(
     def _restore_bf16_binding(self) -> None:
         if self.dual_precision_enabled:
             self._bind_base_precision(BASE_PRECISION_BF16)
+
+    def mark_dual_precision_lifecycle_event(self, kind: str) -> None:
+        """Dual precision (C2): arm one shadow re-validation at the next INT4
+        bind after a sleep / wake-up / weight-load event. The worker calls it
+        from ``sleep`` and ``wake_up``; a vanilla tree never gets past the
+        flag check."""
+        if not self.dual_precision_enabled:
+            return
+        model = getattr(self, "model", None)
+        if model is not None:
+            mark_lifecycle_event(model, kind)
 
     def _warmup_and_capture(
         self,

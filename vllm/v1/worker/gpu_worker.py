@@ -172,6 +172,7 @@ class Worker(WorkerBase):
 
         allocator = CuMemAllocator.get_instance()
         allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+        self._mark_dual_precision_lifecycle_event("sleep")
         free_bytes_after_sleep, total = torch.cuda.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         used_bytes = total - free_bytes_after_sleep
@@ -198,6 +199,15 @@ class Worker(WorkerBase):
 
         if tags is None or "kv_cache" in tags:
             self.model_runner.post_kv_cache_wake_up()
+        if tags is None or "weights" in tags:
+            self._mark_dual_precision_lifecycle_event("wake_up")
+
+    def _mark_dual_precision_lifecycle_event(self, kind: str) -> None:
+        """Dual precision (C2): the V1 runner re-validates the INT4 shadow at
+        the next INT4 bind after this event; other runners have no hook."""
+        mark = getattr(self.model_runner, "mark_dual_precision_lifecycle_event", None)
+        if mark is not None:
+            mark(kind)
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         if not self.vllm_config.model_config.enable_cumem_allocator:
@@ -1073,6 +1083,7 @@ class Worker(WorkerBase):
         # NCCL broadcast/packed path are asynchronous.
         # Sync here so the next step uses the new weights.
         torch.accelerator.synchronize()
+        self._mark_dual_precision_lifecycle_event("update_weights")
 
     def finish_weight_update(self) -> None:
         """

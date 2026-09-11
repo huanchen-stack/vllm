@@ -25,9 +25,15 @@ this component only makes both bases available and switchable.
    `VLLM_DUAL_PRECISION_INT4_MODEL` is loaded through the normal model loader
    with a cloned `VllmConfig` (`make_int4_vllm_config`: same everything except
    `model`/`hf_config_path`, `model_weights=""`, `quantization=None` so the
-   shadow's own quant config is auto-detected, and a fresh
+   shadow's own quant config is auto-detected, a fresh
    `CompilationConfig` so the shadow's attention layers register in their own
-   static forward context). The format is validated first
+   static forward context, and its own `LoadConfig` with `load_format=auto`
+   whatever the engine's is: verl's rollout default `load_format: dummy`
+   used to reach the shadow through the clone and the store was
+   `DummyModelLoader` noise, i.e. every INT4-phase token was garbage
+   (integration defect 1); a dummy engine is announced at WARNING and
+   `load_int4_shadow_model` refuses a dummy shadow config outright). The
+   format is validated first
    (`validate_shadow_quantization`): Intel AutoRound `auto_round:auto_gptq`,
    plain GPTQ, or compressed-tensors `pack-quantized` are accepted; AWQ in any
    form raises `ValueError`.
@@ -62,16 +68,45 @@ this component only makes both bases available and switchable.
    precision)` flips `active` for every binding; it never touches
    `_modules`, `_parameters` or `_buffers` (GEMMA4 audit invariant 1), is
    idempotent per (precision, analysis mask), and logs once per precision.
+   Log-line contract: `Dual precision QLoRA base path bound: precision=%s,
+   lora_base_layers=%d, rebound_layers=%d, int4_shadow_active=%d,
+   analysis_bf16_layers=%s.` is emitted at **WARNING** (one line per
+   precision / mask), because verl launches vLLM with
+   `VLLM_LOGGING_LEVEL=WARN` and its `validate_rollout_run.py
+   --expected-lora-layers` parses `lora_base_layers=` and `precision=int4
+   ... int4_shadow_active=` from it (integration defect 3).
    The compiled graph sees one stable op, so one Dynamo graph serves both
    precisions and each precision captures its own CUDA graph
    (`BatchDescriptor.base_precision` is part of the graph key; C3/C4 wire the
    bind calls before capture/replay/eager forwards).
-5. **Validation** (`validation`, both off by default).
-   `VLLM_DUAL_PRECISION_VALIDATE_SHADOW=1` compares every attached INT4 linear
-   with its BF16 twin on a random input and logs the ten worst cosines.
-   `VLLM_DUAL_PRECISION_VALIDATE_LIFECYCLE=1` records fixed-input probes for
-   the first six attached linears at load and re-runs them at the first INT4
-   bind, logging `exact=True/False` per probe.
+5. **Validation** (`validation`). One check is always on: the *sanity
+   probe* runs one random input through the first attached layer, INT4 and
+   BF16 base, and raises `RuntimeError` (naming the layer, the cosine and the
+   shadow load format) unless the cosine exceeds `SANITY_MIN_COSINE = 0.5`
+   (a real GPTQ shadow scores >= 0.9, random weights ~0), so a random shadow
+   can never start serving. It runs at attach before any override is
+   installed; when the engine loaded dummy base weights (verl syncs the
+   trainer's weights later) the BF16 twin is noise, so the probe is deferred
+   to the first INT4 bind after the first weight-load lifecycle event
+   (`sanity_probe_pending` on the state). Two further checks are off by
+   default: `VLLM_DUAL_PRECISION_VALIDATE_SHADOW=1` compares every attached
+   INT4 linear with its BF16 twin on a random input and logs the ten worst
+   cosines. `VLLM_DUAL_PRECISION_VALIDATE_LIFECYCLE=1` records fixed-input
+   probes for the first six attached linears at load, re-runs them at the
+   first INT4 bind (the baseline, which under a server is the CUDA-graph
+   capture during init) and again at the first INT4 bind after every
+   lifecycle event, logging `exact=True/False` per probe at WARNING (ERROR
+   when a probe is no longer exact). Lifecycle events are marked through
+   `mark_lifecycle_event(model, kind)`: the worker's `sleep` / `wake_up`
+   (`sleep`, `wake_up`), the runner's `reload_weights`, the worker's
+   `update_weights`, and every `model.load_weights(...)` call (the attach
+   wraps the method on the instance, a `__dict__` entry, because verl's
+   colocated worker extension streams the trainer's base weights with
+   `model.load_weights` straight on the model). An event arms exactly one
+   re-validation at the next INT4 bind, even an INT4 -> INT4 rebind across a
+   wake-up; without an event no re-validation happens (integration defect
+   4: the old first-bind-only probe ran before any sleep/wake or weight sync
+   and proved nothing about the shadow at rollout time).
 
 ## Knobs (all registered in `vllm/envs.py`; defaults keep vanilla behavior)
 
@@ -82,7 +117,7 @@ this component only makes both bases available and switchable.
 | `VLLM_DUAL_PRECISION_BF16_LAYERS` | `first:3,last:3` | blocks kept BF16 (`none`, `first:N`, `last:N`, `i`, `a-b`); every final run used `none` |
 | `VLLM_DUAL_PRECISION_INT4_MODULES` | `all` | `all` or `mlp_only` (Gemma4 E2B/E4B QAT runs) |
 | `VLLM_DUAL_PRECISION_VALIDATE_SHADOW` | `0` | numerical check at load |
-| `VLLM_DUAL_PRECISION_VALIDATE_LIFECYCLE` | `0` | probes at load, re-check at first INT4 bind |
+| `VLLM_DUAL_PRECISION_VALIDATE_LIFECYCLE` | `0` | probes at load, re-check at first INT4 bind and after every sleep/wake-up/weight-load event |
 
 verl: `actor_rollout_ref.rollout.model_path` (null: reuse the actor path)
 and the C8 block `actor_rollout_ref.rollout.precision_scheduler.{enable,

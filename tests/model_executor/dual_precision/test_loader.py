@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Shadow-format validation and INT4 config cloning."""
 
+import logging
 import os
 from dataclasses import fields
 
@@ -9,7 +10,9 @@ import pytest
 
 from vllm.model_executor.dual_precision.loader import (
     clone_init_dataclass,
+    load_int4_shadow_model,
     make_int4_vllm_config,
+    make_shadow_load_config,
     validate_shadow_quantization,
 )
 
@@ -91,6 +94,52 @@ def test_clone_init_dataclass_keeps_every_init_field():
     assert clone.static_forward_context == {}
 
 
+def test_shadow_load_config_is_auto_even_when_engine_loads_dummy(caplog):
+    """verl's ``rollout.load_format: dummy`` must never reach the shadow: the
+    INT4 checkpoint is real weights by definition, so its clone always says
+    ``auto`` and the dummy engine is announced at WARNING."""
+    from vllm.config.load import LoadConfig
+
+    engine = LoadConfig(load_format="dummy", download_dir="/nonexistent/cache")
+    with caplog.at_level(logging.WARNING, logger="vllm"):
+        shadow = make_shadow_load_config(engine)
+    assert shadow is not engine
+    assert shadow.load_format == "auto"
+    assert engine.load_format == "dummy"
+    assert shadow.download_dir == engine.download_dir
+    assert any(
+        "shadow" in rec.message and "dummy" in rec.message and "auto" in rec.message
+        for rec in caplog.records
+        if rec.levelno == logging.WARNING
+    ), caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="vllm"):
+        plain = make_shadow_load_config(LoadConfig(load_format="auto"))
+    assert plain.load_format == "auto"
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    # Every other explicit format is coerced too (the shadow is a checkpoint).
+    assert (
+        make_shadow_load_config(LoadConfig(load_format="safetensors")).load_format
+        == "auto"
+    )
+
+
+def test_load_int4_shadow_model_refuses_dummy_loader():
+    """Belt and braces below :func:`make_shadow_load_config`."""
+    from types import SimpleNamespace
+
+    from vllm.config.load import LoadConfig
+
+    config = SimpleNamespace(
+        load_config=LoadConfig(load_format="dummy"),
+        model_config=SimpleNamespace(model="/nonexistent/int4"),
+    )
+    with pytest.raises(RuntimeError, match="dummy"):
+        load_int4_shadow_model(config)
+
+
 def _require(path: str) -> str:
     if not os.path.isdir(path):
         pytest.skip(f"checkpoint not available: {path}")
@@ -103,11 +152,15 @@ def test_make_int4_vllm_config_clone_fields():
 
     bf16 = _require(QWEN35_9B_BF16)
     int4 = _require(QWEN35_9B_AUTOROUND)
+    from vllm.config.load import LoadConfig
+
     model_config = ModelConfig(
         model=bf16, tokenizer=bf16, dtype="bfloat16", max_model_len=512, seed=0
     )
     vllm_config = VllmConfig(
-        model_config=model_config, lora_config=LoRAConfig(max_lora_rank=16)
+        model_config=model_config,
+        lora_config=LoRAConfig(max_lora_rank=16),
+        load_config=LoadConfig(load_format="dummy"),
     )
     vllm_config.compilation_config.static_forward_context["attn"] = object()
 
@@ -134,6 +187,7 @@ def test_make_int4_vllm_config_clone_fields():
         if field.init and field.name not in {
             "model_config",
             "compilation_config",
+            "load_config",
             "quant_config",
             "instance_id",
         }:
@@ -141,6 +195,10 @@ def test_make_int4_vllm_config_clone_fields():
                 vllm_config, field.name
             ), field.name
     assert int4_config.lora_config is vllm_config.lora_config
+    # The shadow never inherits the engine's dummy loader (integration defect 1).
+    assert int4_config.load_config is not vllm_config.load_config
+    assert int4_config.load_config.load_format == "auto"
+    assert vllm_config.load_config.load_format == "dummy"
     # The shadow config resolves its own quant config; the BF16 one stays None.
     assert type(int4_config.quant_config).__name__ == "INCConfig"
     assert vllm_config.quant_config is None

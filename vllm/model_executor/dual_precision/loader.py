@@ -32,6 +32,7 @@ from vllm.model_executor.dual_precision.binding import (
     DualPrecisionState,
     find_lora_wrappers,
     install_binding,
+    mark_lifecycle_event,
     set_dual_precision_state,
 )
 from vllm.model_executor.dual_precision.policy_layers import (
@@ -48,6 +49,7 @@ from vllm.model_executor.dual_precision.validation import (
     compare_shadow_numerics,
     log_shadow_validation,
     record_lifecycle_probe,
+    sanity_probe_shadow,
 )
 from vllm.model_executor.layers.linear import LinearBase
 
@@ -208,9 +210,43 @@ def validate_shadow_quantization(
     )
 
 
+SHADOW_LOAD_FORMAT = "auto"
+"""The shadow is always loaded from its checkpoint, whatever the engine does."""
+
+
+def make_shadow_load_config(load_config: Any) -> Any:
+    """Clone the engine's ``LoadConfig`` for the shadow with ``load_format``
+    forced to :data:`SHADOW_LOAD_FORMAT`.
+
+    verl's rollout default (``rollout.load_format: dummy``, the trainer syncs
+    the real base weights later) used to reach the shadow through the plain
+    config clone, so the INT4 store was ``DummyModelLoader`` noise and every
+    INT4-phase token was garbage (integration defect 1). The shadow checkpoint
+    is real weights by definition, so its loader is always ``auto``; a dummy
+    engine is announced at WARNING so the log explains the extra load time.
+    """
+    engine_format = str(load_config.load_format).lower()
+    if engine_format == "dummy":
+        logger.warning(
+            "Dual precision: engine load_format=dummy, but the INT4 shadow is "
+            "loaded with load_format=%s regardless (the shadow checkpoint is "
+            "real weights; a dummy shadow would serve random INT4 tokens).",
+            SHADOW_LOAD_FORMAT,
+        )
+    elif engine_format != SHADOW_LOAD_FORMAT:
+        logger.info(
+            "Dual precision: engine load_format=%s; the INT4 shadow uses "
+            "load_format=%s.",
+            engine_format,
+            SHADOW_LOAD_FORMAT,
+        )
+    return clone_init_dataclass(load_config, load_format=SHADOW_LOAD_FORMAT)
+
+
 def make_int4_vllm_config(vllm_config: VllmConfig, int4_model: str) -> VllmConfig:
     """Clone ``vllm_config`` so it loads ``int4_model`` with auto-detected
-    quantization and its own compilation config (own static forward context).
+    quantization, its own compilation config (own static forward context)
+    and its own load config (:func:`make_shadow_load_config`).
     """
     if not int4_model:
         raise ValueError(
@@ -230,19 +266,29 @@ def make_int4_vllm_config(vllm_config: VllmConfig, int4_model: str) -> VllmConfi
         int4_model_config.quantization,
     )
     int4_compilation_config = clone_init_dataclass(vllm_config.compilation_config)
+    int4_load_config = make_shadow_load_config(vllm_config.load_config)
     return clone_init_dataclass(
         vllm_config,
         model_config=int4_model_config,
         compilation_config=int4_compilation_config,
+        load_config=int4_load_config,
     )
 
 
 def load_int4_shadow_model(int4_vllm_config: VllmConfig) -> nn.Module:
     from vllm.model_executor.model_loader import get_model_loader
 
+    load_format = str(int4_vllm_config.load_config.load_format).lower()
+    if load_format == "dummy":
+        raise RuntimeError(
+            "Dual precision INT4 shadow must be loaded from its checkpoint; "
+            "load_format=dummy would serve random INT4 weights. Build the "
+            "shadow config with make_int4_vllm_config."
+        )
     logger.info(
-        "Loading dual precision INT4 shadow model from %s...",
+        "Loading dual precision INT4 shadow model from %s (load_format=%s)...",
         int4_vllm_config.model_config.model,
+        load_format,
     )
     loader = get_model_loader(int4_vllm_config.load_config)
     int4_model = loader.load_model(
@@ -293,9 +339,18 @@ def attach_shadow_layers(
     dtype: torch.dtype,
     validate_shadow: bool = False,
     validate_lifecycle: bool = False,
+    engine_load_format: str = SHADOW_LOAD_FORMAT,
+    shadow_load_format: str = SHADOW_LOAD_FORMAT,
 ) -> DualPrecisionState:
     """Match, bind and store. Pure of env access; the runner entry point
-    :func:`attach_dual_precision` supplies the knobs."""
+    :func:`attach_dual_precision` supplies the knobs.
+
+    The always-on sanity probe (:func:`sanity_probe_shadow`) runs here on the
+    first attached layer before anything is installed, unless
+    ``engine_load_format`` is ``dummy``: then the BF16 twin is noise until the
+    trainer syncs weights, and the probe is deferred to the first INT4 bind
+    after a weight-load lifecycle event.
+    """
     bf16_layer_indices = resolve_bf16_layer_indices(bf16_layer_policy, num_layers)
     logger.info(
         "Dual precision BF16 layer policy %r resolved to transformer blocks %s of %d.",
@@ -346,16 +401,46 @@ def attach_shadow_layers(
             "layers were attached to a LoRA wrapper."
         )
 
+    plan: list[tuple[str, nn.Module, LinearBase | None]] = []
+    for name, wrapper in wrappers.items():
+        int4_layer = quantized.get(name)
+        if int4_layer is None or not should_attach_int4_shadow(
+            name, bf16_layer_indices, module_policy
+        ):
+            int4_layer = None
+        plan.append((name, wrapper, int4_layer))
+
+    # Always-on sanity probe on the first attached layer, still before any
+    # override is installed so a failure leaves the model untouched.
+    sanity_probe_pending = False
+    first_name, first_wrapper, first_int4 = next(
+        item for item in plan if item[2] is not None
+    )
+    if str(engine_load_format).lower() == "dummy":
+        sanity_probe_pending = True
+        logger.warning(
+            "Dual precision: engine load_format=dummy, so the INT4 shadow "
+            "sanity probe on %s is deferred to the first INT4 bind after the "
+            "base weights are loaded.",
+            first_name,
+        )
+    else:
+        sanity_probe_shadow(
+            first_name,
+            first_wrapper.base_layer,
+            first_int4,
+            dtype,
+            shadow_load_format=shadow_load_format,
+            when="at attach",
+        )
+
     bindings: list[DualPrecisionBinding] = []
     attached_layers: list[tuple[str, LinearBase]] = []
     validations: list[ShadowValidation] = []
     probes: list[LifecycleProbe] = []
-    for name, wrapper in wrappers.items():
+    for name, wrapper, int4_layer in plan:
         layer_index = transformer_layer_index(name)
-        int4_layer = quantized.get(name)
-        if int4_layer is not None and should_attach_int4_shadow(
-            name, bf16_layer_indices, module_policy
-        ):
+        if int4_layer is not None:
             attached_layers.append((name, int4_layer))
             if validate_shadow:
                 validations.append(
@@ -363,8 +448,6 @@ def attach_shadow_layers(
                 )
             if validate_lifecycle and len(probes) < MAX_LIFECYCLE_PROBES:
                 probes.append(record_lifecycle_probe(name, int4_layer, dtype))
-        else:
-            int4_layer = None
         bindings.append(
             install_binding(
                 wrapper, name, int4_layer, layer_index, static_forward_context
@@ -382,6 +465,9 @@ def attach_shadow_layers(
         unwrapped=unwrapped,
         shadow_bytes=module_tensor_bytes(store),
         lifecycle_probes=probes,
+        probe_dtype=dtype,
+        shadow_load_format=str(shadow_load_format),
+        sanity_probe_pending=sanity_probe_pending,
     )
     set_dual_precision_state(model, state)
     register_shadow_store(model, store)
@@ -408,6 +494,31 @@ def attach_shadow_layers(
     )
     log_shadow_validation(validations)
     return state
+
+
+LOAD_WEIGHTS_ATTR = "load_weights"
+
+
+def wrap_load_weights_for_lifecycle(model: nn.Module) -> None:
+    """Make every ``model.load_weights(...)`` call mark a ``load_weights``
+    lifecycle event.
+
+    verl's colocated worker extension streams the trainer's base weights with
+    ``model.load_weights`` straight on the model (not through the runner), so
+    this instance-level wrapper is the only vLLM-side hook that sees it. It is
+    a plain ``__dict__`` entry (never ``_modules``); ``torch.compile`` only
+    traces ``forward``.
+    """
+    original = getattr(model, LOAD_WEIGHTS_ATTR, None)
+    if original is None or LOAD_WEIGHTS_ATTR in model.__dict__:
+        return
+
+    def load_weights(*args: Any, **kwargs: Any) -> Any:
+        mark_lifecycle_event(model, "load_weights")
+        return original(*args, **kwargs)
+
+    load_weights.__wrapped__ = original  # type: ignore[attr-defined]
+    object.__setattr__(model, LOAD_WEIGHTS_ATTR, load_weights)
 
 
 def attach_dual_precision(
@@ -442,7 +553,10 @@ def attach_dual_precision(
             dtype=vllm_config.model_config.dtype,
             validate_shadow=envs.VLLM_DUAL_PRECISION_VALIDATE_SHADOW,
             validate_lifecycle=envs.VLLM_DUAL_PRECISION_VALIDATE_LIFECYCLE,
+            engine_load_format=str(vllm_config.load_config.load_format),
+            shadow_load_format=str(int4_vllm_config.load_config.load_format),
         )
+        wrap_load_weights_for_lifecycle(model)
     finally:
         # Only the attached linears survive, owned by the shadow store.
         del int4_model

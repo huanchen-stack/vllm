@@ -82,8 +82,22 @@ class DualPrecisionState:
     analysis_label: str | None = None
     lifecycle_probes: list[LifecycleProbe] = field(default_factory=list)
     lifecycle_validated: bool = False
+    pending_lifecycle_events: list[str] = field(default_factory=list)
+    """Events since the last INT4 bind (``mark_lifecycle_event``); the next
+    INT4 bind re-runs the lifecycle probes and clears the list."""
+    probe_dtype: torch.dtype | None = None
+    shadow_load_format: str = "auto"
+    sanity_probe_pending: bool = False
+    """The attach-time sanity probe was deferred (dummy base weights): run it
+    at the first INT4 bind after a weight-load event."""
     bound_state_key: tuple[Any, ...] | None = None
     logged_bind_keys: set[tuple[Any, ...]] = field(default_factory=set)
+
+
+LIFECYCLE_WEIGHT_EVENTS: frozenset[str] = frozenset(
+    {"load_weights", "reload_weights", "update_weights"}
+)
+"""Lifecycle events after which the base weights may differ from attach time."""
 
 
 # --------------------------------------------------------------------------- #
@@ -237,6 +251,50 @@ def get_active_precision(model: nn.Module) -> str:
     return BASE_PRECISION_BF16 if state is None else state.active_precision
 
 
+def mark_lifecycle_event(model: nn.Module, kind: str) -> None:
+    """Arm one re-validation at the next INT4 bind.
+
+    Called by the worker (``sleep`` / ``wake_up``), the runner's weight
+    reload and the model's ``load_weights`` (wrapped at attach). No-op when
+    dual precision is not attached, so vanilla paths pay nothing. Repeated
+    events of one kind between two INT4 binds collapse into one entry.
+    """
+    state = get_dual_precision_state(model)
+    if state is None:
+        return
+    if kind not in state.pending_lifecycle_events:
+        state.pending_lifecycle_events.append(kind)
+
+
+def _run_int4_bind_validations(state: DualPrecisionState) -> None:
+    """Lifecycle probes (baseline at the first INT4 bind, again after every
+    marked event) and the deferred sanity probe, before the wrappers flip."""
+    from vllm.model_executor.dual_precision.validation import (
+        sanity_probe_shadow,
+        validate_shadow_lifecycle,
+    )
+
+    events = list(state.pending_lifecycle_events)
+    state.pending_lifecycle_events.clear()
+    if not state.lifecycle_validated:
+        validate_shadow_lifecycle(state)
+    elif events:
+        validate_shadow_lifecycle(state, after=events)
+    weight_events = [kind for kind in events if kind in LIFECYCLE_WEIGHT_EVENTS]
+    if state.sanity_probe_pending and weight_events:
+        state.sanity_probe_pending = False
+        first = next((b for b in state.bindings if b.shadow_active), None)
+        if first is not None and state.probe_dtype is not None:
+            sanity_probe_shadow(
+                first.module_name,
+                first.bf16,
+                first.int4_or_fallback,
+                state.probe_dtype,
+                shadow_load_format=state.shadow_load_format,
+                when="at the first INT4 bind after " + ",".join(weight_events),
+            )
+
+
 def bind_dual_precision(
     model: nn.Module,
     precision: str,
@@ -257,18 +315,20 @@ def bind_dual_precision(
             f"Unknown base precision {precision!r}; expected one of {BASE_PRECISIONS}."
         )
 
+    # Validations come before the idempotence check: an INT4 -> INT4 rebind
+    # across a wake-up or weight sync must still re-run the probes.
+    if precision == BASE_PRECISION_INT4 and (
+        not state.lifecycle_validated
+        or state.pending_lifecycle_events
+        or state.sanity_probe_pending
+    ):
+        _run_int4_bind_validations(state)
+
     analysis_layers = state.analysis_bf16_layers
     analysis_key = None if analysis_layers is None else tuple(sorted(analysis_layers))
     bound_state_key = (precision, analysis_key)
     if state.bound_state_key == bound_state_key:
         return
-
-    if precision == BASE_PRECISION_INT4 and not state.lifecycle_validated:
-        from vllm.model_executor.dual_precision.validation import (
-            validate_shadow_lifecycle,
-        )
-
-        validate_shadow_lifecycle(state)
 
     rebound = 0
     shadow_active = 0
@@ -293,7 +353,10 @@ def bind_dual_precision(
     if log_key in state.logged_bind_keys:
         return
     state.logged_bind_keys.add(log_key)
-    logger.info(
+    # Log-line contract (WARNING, as archived): verl's validate_rollout_run.py
+    # reads ``lora_base_layers=`` and ``precision=int4 ... int4_shadow_active=``
+    # from a run that sets VLLM_LOGGING_LEVEL=WARN.
+    logger.warning(
         "Dual precision QLoRA base path bound: precision=%s, "
         "lora_base_layers=%d, rebound_layers=%d, int4_shadow_active=%d, "
         "analysis_bf16_layers=%s.",

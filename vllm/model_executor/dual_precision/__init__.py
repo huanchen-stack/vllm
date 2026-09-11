@@ -10,6 +10,8 @@ the scheduler-side switch:
 * :func:`check_dual_precision_model_runner` (worker init: V1 runner only)
 * :func:`attach_dual_precision` (once, after LoRA load)
 * :func:`bind_dual_precision` (before every capture / replay / eager forward)
+* :func:`mark_lifecycle_event` (worker sleep/wake-up, runner weight reload;
+  arms a shadow re-validation at the next INT4 bind)
 * :func:`get_active_precision`
 * :data:`BASE_PRECISION_BF16`, :data:`BASE_PRECISION_INT4`,
   :data:`SHADOW_MODULE_NAME`
@@ -26,6 +28,7 @@ from vllm.model_executor.dual_precision.binding import (
     get_active_precision,
     get_binding,
     get_dual_precision_state,
+    mark_lifecycle_event,
     set_analysis_bf16_layers,
 )
 from vllm.model_executor.dual_precision.loader import (
@@ -52,5 +55,6 @@ __all__ = [
     "get_active_precision",
     "get_binding",
     "get_dual_precision_state",
+    "mark_lifecycle_event",
     "set_analysis_bf16_layers",
 ]

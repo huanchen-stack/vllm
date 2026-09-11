@@ -172,17 +172,33 @@ def build_int4_model(
     seed: int = 1,
     device="cpu",
     dtype=torch.float32,
+    base_seed: int | None = 0,
+    noise: float = 0.05,
 ) -> FakeModel:
-    """An INT4-style model: ``quantized`` names are ``FakeInt4Linear``."""
+    """An INT4-style model: ``quantized`` names are ``FakeInt4Linear``.
+
+    By default the weights are the BF16 model's (``base_seed``, the seed
+    ``build_wrapped_model`` used) plus ``noise`` times a ``seed``-drawn
+    perturbation, so the fake shadow passes the always-on sanity probe the
+    way a real GPTQ shadow does while still producing distinct outputs.
+    ``base_seed=None`` draws independent weights (a "random shadow").
+    """
     modules: dict[str, nn.Module] = {}
     generator = torch.Generator().manual_seed(seed)
+    base_generator = (
+        None if base_seed is None else torch.Generator().manual_seed(base_seed)
+    )
     for name in names:
         cls = FakeInt4Linear if name in quantized else FakeLinear
+        weight = torch.randn(hidden, hidden, generator=generator)
+        if base_generator is not None:
+            base = torch.randn(hidden, hidden, generator=base_generator)
+            weight = base + noise * weight
         modules[name] = cls(
             hidden,
             hidden,
             prefix=name,
-            weight=torch.randn(hidden, hidden, generator=generator),
+            weight=weight,
             dtype=dtype,
             device=device,
         )
