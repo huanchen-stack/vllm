@@ -1294,7 +1294,15 @@ def test_offline_table_equals_online_prediction_on_validation_states():
         prediction = model.predict_receding_horizon(
             row["frontier"], row["live_batch"], float(row["prompt_bucket"])
         )
-        planned = None if prediction is None else prediction.planned_frontier
+        # ``direct`` is the planned frontier gated on the policy's
+        # required_gain_seconds (30 s): 7 of the 87 rows plan a switch whose
+        # gain is below the margin and are recorded as None.
+        planned = (
+            None
+            if prediction is None
+            or prediction.predicted_gain_seconds <= model.required_gain_seconds
+            else prediction.planned_frontier
+        )
         assert planned == row["direct"], row
     archived_table = (
         ARCHIVE
