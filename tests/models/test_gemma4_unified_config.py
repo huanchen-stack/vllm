@@ -20,6 +20,10 @@ FIXTURE = Path(__file__).parent / "fixtures" / "gemma4_unified_12b_config.json"
 
 UNIFIED_ARCH = "Gemma4UnifiedForConditionalGeneration"
 
+# The module-scoped distributed env below is torn down once at module end
+# instead of by the per-test cleanup fixture in tests/conftest.py.
+pytestmark = pytest.mark.skip_global_cleanup
+
 
 @pytest.fixture(scope="module")
 def unified_model_dir(tmp_path_factory):
