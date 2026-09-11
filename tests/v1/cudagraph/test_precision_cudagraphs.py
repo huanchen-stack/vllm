@@ -524,18 +524,47 @@ def test_vanilla_equivalence_when_disabled(
 # ---------------------------------------------------------------------------
 
 
-def _config_with_v2(use_v2: bool) -> MagicMock:
+def _engine_config(
+    *,
+    use_v2: bool = False,
+    spec_decode: bool = False,
+    fast_prefill: bool = False,
+    dp: int = 1,
+) -> MagicMock:
     config = MagicMock(spec=VllmConfig)
     config.use_v2_model_runner = use_v2
+    config.speculative_config = MagicMock() if spec_decode else None
+    config.cache_config = MagicMock()
+    config.cache_config.kv_sharing_fast_prefill = fast_prefill
+    config.parallel_config = MagicMock()
+    config.parallel_config.data_parallel_size = dp
     return config
 
 
 def test_v2_model_runner_guard(dual_precision_env):
     dual_precision_env(enabled=True, policy="fixed_frontier:8000")
     with pytest.raises(NotImplementedError, match="V2 model runner"):
-        check_dual_precision_model_runner(_config_with_v2(True))
-    check_dual_precision_model_runner(_config_with_v2(False))
+        check_dual_precision_model_runner(_engine_config(use_v2=True))
+    check_dual_precision_model_runner(_engine_config())
 
     dual_precision_env(enabled=False)
-    check_dual_precision_model_runner(_config_with_v2(True))
-    check_dual_precision_model_runner(_config_with_v2(False))
+    check_dual_precision_model_runner(_engine_config(use_v2=True))
+    check_dual_precision_model_runner(_engine_config())
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"spec_decode": True}, "speculative"),
+        ({"fast_prefill": True}, "kv_sharing_fast_prefill"),
+        ({"dp": 2}, "data parallelism"),
+    ],
+)
+def test_unsupported_engine_features_are_refused(dual_precision_env, kwargs, match):
+    """Paths that dispatch forwards without a base precision (implicitly
+    BF16) or choose it per DP rank are refused at worker init."""
+    dual_precision_env(enabled=True, policy="fixed_frontier:8000")
+    with pytest.raises(NotImplementedError, match=match):
+        check_dual_precision_model_runner(_engine_config(**kwargs))
+    dual_precision_env(enabled=False)
+    check_dual_precision_model_runner(_engine_config(**kwargs))

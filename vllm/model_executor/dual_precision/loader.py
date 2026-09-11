@@ -85,19 +85,42 @@ def dual_precision_rollout_enabled() -> bool:
 
 
 def check_dual_precision_model_runner(vllm_config: VllmConfig) -> None:
-    """Refuse the V2 model runner when dual precision is enabled.
+    """Refuse engine configurations dual precision does not support.
 
     Only the V1 ``GPUModelRunner`` attaches the shadow, binds the base
     precision before every forward and captures precision-keyed CUDA graphs.
     The V2 runner (``VLLM_USE_V2_MODEL_RUNNER=1``, or the default for
     unquantized ``Qwen3ForCausalLM``) would silently serve BF16 for every
-    step; fail at worker init instead. No-op when the feature is off.
+    step; fail at worker init instead. Speculative decoding, the KV-sharing
+    fast-prefill path and data parallelism dispatch extra forwards with
+    descriptors that carry no precision (implicitly BF16) or choose the
+    precision per DP rank, so they are refused as well. No-op when the
+    feature is off.
     """
-    if dual_precision_rollout_enabled() and vllm_config.use_v2_model_runner:
+    if not dual_precision_rollout_enabled():
+        return
+    if vllm_config.use_v2_model_runner:
         raise NotImplementedError(
             "VLLM_DUAL_PRECISION_ROLLOUT=1 is not supported with the V2 model "
             "runner: the INT4 shadow is attached, bound and graph-captured by "
             "the V1 GPUModelRunner only. Set VLLM_USE_V2_MODEL_RUNNER=0."
+        )
+    if vllm_config.speculative_config is not None:
+        raise NotImplementedError(
+            "VLLM_DUAL_PRECISION_ROLLOUT=1 is not supported with speculative "
+            "decoding: draft forwards carry no base precision."
+        )
+    if vllm_config.cache_config.kv_sharing_fast_prefill:
+        raise NotImplementedError(
+            "VLLM_DUAL_PRECISION_ROLLOUT=1 is not supported with "
+            "kv_sharing_fast_prefill: the decoder-portion dispatch carries no "
+            "base precision."
+        )
+    if vllm_config.parallel_config.data_parallel_size > 1:
+        raise NotImplementedError(
+            "VLLM_DUAL_PRECISION_ROLLOUT=1 is not supported with data "
+            "parallelism: the precision is chosen per DP rank's scheduler and "
+            "is not synchronised across ranks."
         )
 
 
