@@ -89,7 +89,7 @@ point (`add_shrink`, `add_expand`, `add_lora_embedding`, the Punica branch of
 metadata sync is paid lazily and only when an adapter targets `lm_head` /
 `embed_tokens` / MoE experts or a batch carries several adapters. One warning
 line is logged when the fast path first fires
-(`Rollout QLoRA torch path active: fused_packed=..., lora_index=..., slices=...`)
+(`Rollout QLoRA torch path active: fused_packed=..., lora_index=..., tokens=...`)
 and one when it first falls back, with the token-id set that caused it.
 
 ### Dual stream and the base-forward override
@@ -103,7 +103,9 @@ the two small LoRA GEMMs are queued before the large base GEMM starts.
 `BaseLinearLayerWithLoRA.base_forward_override` /
 `set_base_forward_override(fn)` is the hook for the dual-precision component
 (C2): when installed, `apply()` computes the base output as `fn(x, bias)` and
-applies LoRA synchronously on the same stream. **Design decision 1 (accepted
+applies LoRA synchronously on the same stream. Every LoRA linear class honours
+it, including `ReplicatedLinearWithLoRA` (which otherwise calls the base
+layer's own `forward`) and the sharded variants (through `_base_forward`). **Design decision 1 (accepted
 2026-09-11):** with an override installed the dual-stream op is not used. That
 is how every archived dual-precision run behaved (the dual-precision branch
 preceded the dual-stream branch in `apply()`), and the dual-stream gain below
@@ -122,9 +124,19 @@ sharded LoRA).
 | `VLLM_LORA_ENABLE_DUAL_STREAM`  | 0       | Vanilla knob; with `ROLLOUT_QLORA` the LoRA GEMMs launch first. |
 
 Both new knobs are read once at layer / wrapper construction; nothing on the
-forward path touches `os.environ`. Preconditions: `fully_sharded_loras=False`,
-one adapter per batch (verl sets `max_loras=1`), TP=1 is the supported and
-measured configuration.
+forward path touches `os.environ`.
+
+**Preconditions / supported configuration.** `max_loras=1`,
+`fully_sharded_loras=False`, TP=1, and linear-only LoRA target modules (no
+`lm_head` / `embed_tokens` / MoE experts). Under torch.compile (vLLM's
+default fullgraph capture, guards dropped) the fast-path decision taken in
+`_add_lora_linear_rollout` and the `_punica_metadata_prepared` state are
+frozen into the compiled forward at first compile; the Punica fallback for
+mixed batches and the lazy metadata preparation therefore only take effect in
+eager mode (`enforce_eager=True`, or the unit tests). With `max_loras=1` every
+batch makes the same decision, which is why that is the only supported
+setting; `PunicaWrapperGPU` logs a warning when `ROLLOUT_QLORA` is set with
+`max_loras > 1`.
 
 ## Contracts with neighbours
 
@@ -152,7 +164,7 @@ measured configuration.
 
 ## Tests
 
-`tests/lora/test_rollout_lora_fastpath.py` (39 tests, all run on one GPU):
+`tests/lora/test_rollout_lora_fastpath.py` (43 tests, all run on one GPU):
 op fake/real dtype, selection table (incl. the profile-run / capture dummy
 mapping), lazy metadata with a mocked `prepare_tensors`, packed-buffer layout (incl. sub-rank and `None` slices),
 fused and per-slice fast path vs the Punica reference for Column, Row,
@@ -214,9 +226,10 @@ of the headline runs; vanilla vLLM loads it with `MarlinLinearKernel`),
 whereas the archived Marlin column used `mssfj/Qwen3.5-9B-GPTQ-INT4` with a
 wrapped config; absolute values are therefore close but not identical, the
 per-stage gains are what is compared. Spread is max-min of the five
-repetition medians. Every fast-path row carries in-process evidence in its
-JSONL (`rollout_single_lora_index=0`, `punica_metadata_prepared=False`,
-no fallback) and the log line `Rollout QLoRA torch path active:
+repetition medians. Every Marlin row and the BF16 dual row carry in-process
+evidence in their JSONL (`rollout_single_lora_index=0`,
+`punica_metadata_prepared=False`, no fallback; the bf16_torch and
+bf16_torch-fused rows predate the evidence field) and the log line `Rollout QLoRA torch path active:
 fused_packed=..., lora_index=0, tokens=8192`. The rows are committed under
 `tools/rollout_lora/results/qwen35_9b_tp1_2026-09-11/`.
 
