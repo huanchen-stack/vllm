@@ -57,6 +57,8 @@ def test_bf16_2x2_heatmap_smoke(tmp_path):
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
+    if not os.environ.get("CUDA_VISIBLE_DEVICES"):
+        pytest.skip("run under run_gpu.sh (decision 13): CUDA_VISIBLE_DEVICES is unset")
     model = os.environ.get("TPOT_HEATMAP_SMOKE_MODEL", DEFAULT_MODEL)
     if not Path(model).exists():
         pytest.skip(f"checkpoint not found: {model}")
