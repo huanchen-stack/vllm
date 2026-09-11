@@ -7,6 +7,7 @@ Public surface consumed by the model runner, the CUDA-graph dispatcher and
 the scheduler-side switch:
 
 * :func:`dual_precision_rollout_enabled`
+* :func:`check_dual_precision_model_runner` (worker init: V1 runner only)
 * :func:`attach_dual_precision` (once, after LoRA load)
 * :func:`bind_dual_precision` (before every capture / replay / eager forward)
 * :func:`get_active_precision`
@@ -31,6 +32,7 @@ from vllm.model_executor.dual_precision.loader import (
     SHADOW_MODULE_NAME,
     Int4ShadowLayerStore,
     attach_dual_precision,
+    check_dual_precision_model_runner,
     dual_precision_rollout_enabled,
 )
 
@@ -44,6 +46,7 @@ __all__ = [
     "Int4ShadowLayerStore",
     "attach_dual_precision",
     "bind_dual_precision",
+    "check_dual_precision_model_runner",
     "dual_precision_rollout_enabled",
     "get_active_base_layer",
     "get_active_precision",

@@ -4,12 +4,38 @@ from collections.abc import Set as AbstractSet
 from dataclasses import replace
 from itertools import product
 
+import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.lora.utils import get_captured_lora_counts
+from vllm.model_executor.dual_precision import (
+    BASE_PRECISION_BF16,
+    BASE_PRECISION_INT4,
+    BASE_PRECISIONS,
+    dual_precision_rollout_enabled,
+)
 
 logger = init_logger(__name__)
+
+
+def resolve_int4_capture_ceiling(max_capture_size: int) -> int | None:
+    """Largest ``num_tokens`` for which an INT4 CUDA graph is captured.
+
+    ``None`` when dual precision is off or no policy is configured (the
+    scheduler then never publishes ``int4``, so INT4 graphs would only cost
+    memory). Otherwise the policy's ``capture_max_batch`` clamped to the
+    capture list (``uniform_w4`` reports an unbounded ceiling).
+    """
+    if not dual_precision_rollout_enabled():
+        return None
+    spec = envs.VLLM_DUAL_PRECISION_POLICY
+    if not spec:
+        return None
+    from vllm.v1.core.sched.precision_policy import load_precision_policy
+
+    ceiling = load_precision_policy(spec).capture_max_batch
+    return min(int(ceiling), int(max_capture_size))
 
 
 class CudagraphDispatcher:
@@ -72,6 +98,11 @@ class CudagraphDispatcher:
         )
         # Default cudagraph_mode to NONE until initialize_cudagraph_keys is called
         self.cudagraph_mode = CUDAGraphMode.NONE
+        # Dual precision (C3): INT4 keys are registered next to the BF16 keys
+        # for LoRA batches up to this many tokens; None when the feature is
+        # off. Set by initialize_cudagraph_keys.
+        self.int4_capture_max_batch: int | None = None
+        self._missing_precision_keys_logged: set[tuple[int, int | None, str]] = set()
 
     def _compute_bs_to_padded_graph_size(self) -> None:
         """Pre-compute the mapping from batch size to padded graph size."""
@@ -167,6 +198,30 @@ class CudagraphDispatcher:
         )
         self.cudagraph_keys[runtime_mode].add(batch_descriptor)
 
+    def _add_precision_cudagraph_keys(
+        self, runtime_mode: CUDAGraphMode, batch_descriptor: BatchDescriptor
+    ) -> None:
+        """Register the BF16 key and, under dual precision, its INT4 twin.
+
+        Twins are registered for LoRA batches only (the INT4 shadow binds
+        LoRA wrappers) and only up to ``int4_capture_max_batch`` (the
+        policy's ``capture_max_batch``): the switch to INT4 happens in the
+        long tail with few live requests, and large prefill graphs are not
+        doubled. A batch with no active adapter during an INT4 step runs
+        eager with a once-per-key warning.
+        """
+        self.add_cudagraph_key(runtime_mode, batch_descriptor)
+        ceiling = self.int4_capture_max_batch
+        if (
+            ceiling is not None
+            and batch_descriptor.has_lora
+            and batch_descriptor.num_tokens <= ceiling
+        ):
+            self.add_cudagraph_key(
+                runtime_mode,
+                replace(batch_descriptor, base_precision=BASE_PRECISION_INT4),
+            )
+
     def initialize_cudagraph_keys(
         self, cudagraph_mode: CUDAGraphMode, uniform_decode_query_len: int = 1
     ):
@@ -180,6 +235,16 @@ class CudagraphDispatcher:
             return
 
         self._compute_bs_to_padded_graph_size()
+
+        self.int4_capture_max_batch = resolve_int4_capture_ceiling(
+            self.compilation_config.max_cudagraph_capture_size
+        )
+        if self.int4_capture_max_batch is not None:
+            logger.info(
+                "Dual precision: INT4 CUDA graphs are captured next to the "
+                "BF16 graphs for LoRA batches up to num_tokens=%d.",
+                self.int4_capture_max_batch,
+            )
 
         # Get LoRA cases to capture
         lora_cases = self._get_lora_cases()
@@ -204,7 +269,9 @@ class CudagraphDispatcher:
                 # because FA3's scheduler_metadata computation depends on it.
                 if cudagraph_mode.mixed_mode() == CUDAGraphMode.PIECEWISE:
                     batch_desc = replace(batch_desc, num_reqs=None, uniform=False)
-                self.add_cudagraph_key(cudagraph_mode.mixed_mode(), batch_desc)
+                self._add_precision_cudagraph_keys(
+                    cudagraph_mode.mixed_mode(), batch_desc
+                )
 
         # if decode cudagraph mode is FULL, and we don't already have mixed
         # mode full cudagraphs then add them here.
@@ -227,7 +294,7 @@ class CudagraphDispatcher:
             for bs, num_active_loras in product(
                 cudagraph_capture_sizes_for_decode, lora_cases
             ):
-                self.add_cudagraph_key(
+                self._add_precision_cudagraph_keys(
                     CUDAGraphMode.FULL,
                     self._create_padded_batch_descriptor(
                         bs, True, num_active_loras > 0, num_active_loras
@@ -239,9 +306,12 @@ class CudagraphDispatcher:
     def dispatch(
         self,
         num_tokens: int,
+        *,
+        num_reqs: int | None = None,
         uniform_decode: bool = False,
         has_lora: bool = False,
         num_active_loras: int = 0,
+        base_precision: str | None = None,
         valid_modes: AbstractSet[CUDAGraphMode] | None = None,
         invalid_modes: AbstractSet[CUDAGraphMode] | None = None,
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
@@ -253,10 +323,18 @@ class CudagraphDispatcher:
 
         Args:
             num_tokens: Number of tokens in the batch.
+            num_reqs: Number of requests in the batch; carried on the eager
+                descriptor when given (``None`` on the bare eager path).
             uniform_decode: Whether the batch is uniform decode (i.e. uniform and query
                 length is uniform_decode_query_len).
             has_lora: Whether LoRA is active.
             num_active_loras: Number of distinct active LoRA adapters.
+            base_precision: Scheduler-owned base precision (``"bf16"`` or
+                ``"int4"``, ``SchedulerOutput.dual_precision_base_precision``).
+                ``None`` means BF16; the dispatcher never derives a precision
+                from a request count. A key that was never captured for the
+                requested precision falls back to eager with a once-per-key
+                warning.
             valid_modes: Set of cudagraph modes that are allowed. None means
                 all modes are allowed.
             invalid_modes: Set of cudagraph modes to exclude. Subtracted from
@@ -275,6 +353,23 @@ class CudagraphDispatcher:
         )
         max_size = self.compilation_config.max_cudagraph_capture_size
 
+        if base_precision is None:
+            precision = BASE_PRECISION_BF16
+        elif base_precision in BASE_PRECISIONS:
+            precision = base_precision
+        else:
+            raise ValueError(
+                f"Unsupported base precision override: {base_precision!r} "
+                f"(expected one of {BASE_PRECISIONS})"
+            )
+
+        def eager() -> tuple[CUDAGraphMode, BatchDescriptor]:
+            # Built only at the NONE return sites: the graph-hit path
+            # allocates nothing beyond vanilla.
+            return CUDAGraphMode.NONE, BatchDescriptor(
+                num_tokens, num_reqs=num_reqs, base_precision=precision
+            )
+
         if (
             not self.keys_initialized
             or self.cudagraph_mode == CUDAGraphMode.NONE
@@ -282,7 +377,7 @@ class CudagraphDispatcher:
             or num_tokens > max_size
             or allowed_modes <= {CUDAGraphMode.NONE}
         ):
-            return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
+            return eager()
 
         effective_num_active_loras = num_active_loras
         if has_lora and num_active_loras > 0:
@@ -307,6 +402,8 @@ class CudagraphDispatcher:
         batch_desc = self._create_padded_batch_descriptor(
             num_tokens, normalized_uniform, has_lora, effective_num_active_loras
         )
+        if precision != BASE_PRECISION_BF16:
+            batch_desc = replace(batch_desc, base_precision=precision)
 
         if CUDAGraphMode.FULL in allowed_modes:
             # check if key exists for full cudagraph
@@ -325,7 +422,22 @@ class CudagraphDispatcher:
             f"No matching cudagraph found and NONE is not in "
             f"allowed_modes={allowed_modes}"
         )
-        return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
+        if base_precision is not None:
+            # A scheduler-driven precision with no captured graph at this
+            # shape (INT4 above the capture ceiling): eager, logged once per
+            # key so eager INT4 steps are visible in the run log.
+            missing_key = (num_tokens, num_reqs, precision)
+            if missing_key not in self._missing_precision_keys_logged:
+                self._missing_precision_keys_logged.add(missing_key)
+                logger.warning(
+                    "No matching dynamic-precision CUDA graph for "
+                    "num_tokens=%d, num_reqs=%s, base_precision=%s; "
+                    "falling back to eager execution.",
+                    num_tokens,
+                    num_reqs,
+                    precision,
+                )
+        return eager()
 
     def get_capture_descs(self) -> list[tuple[CUDAGraphMode, list[BatchDescriptor]]]:
         """

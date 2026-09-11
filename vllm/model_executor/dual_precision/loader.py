@@ -84,6 +84,57 @@ def dual_precision_rollout_enabled() -> bool:
     return bool(envs.VLLM_DUAL_PRECISION_ROLLOUT)
 
 
+def check_dual_precision_model_runner(vllm_config: VllmConfig) -> None:
+    """Refuse engine configurations dual precision does not support.
+
+    Only the V1 ``GPUModelRunner`` attaches the shadow, binds the base
+    precision before every forward and captures precision-keyed CUDA graphs.
+    The V2 runner (``VLLM_USE_V2_MODEL_RUNNER=1``, or the default for
+    unquantized ``Qwen3ForCausalLM``) would silently serve BF16 for every
+    step; fail at worker init instead. Speculative decoding, the KV-sharing
+    fast-prefill path and data parallelism dispatch extra forwards with
+    descriptors that carry no precision (implicitly BF16) or choose the
+    precision per DP rank, so they are refused as well.
+
+    With the feature off, a configured ``VLLM_DUAL_PRECISION_POLICY`` on a
+    LoRA-enabled engine is refused too: the scheduler would publish ``int4``
+    with no shadow attached and every post-switch step would run eager.
+    Without a LoRA config nothing could ever bind, so the scheduler-only
+    smokes (C4, C7) may set a policy alone.
+    """
+    if not dual_precision_rollout_enabled():
+        if envs.VLLM_DUAL_PRECISION_POLICY and vllm_config.lora_config is not None:
+            raise NotImplementedError(
+                "VLLM_DUAL_PRECISION_POLICY requires VLLM_DUAL_PRECISION_ROLLOUT=1 "
+                "on a LoRA-enabled engine: without the INT4 shadow the "
+                "scheduler's int4 steps would have no graph and run eager."
+            )
+        return
+    if vllm_config.use_v2_model_runner:
+        raise NotImplementedError(
+            "VLLM_DUAL_PRECISION_ROLLOUT=1 is not supported with the V2 model "
+            "runner: the INT4 shadow is attached, bound and graph-captured by "
+            "the V1 GPUModelRunner only. Set VLLM_USE_V2_MODEL_RUNNER=0."
+        )
+    if vllm_config.speculative_config is not None:
+        raise NotImplementedError(
+            "VLLM_DUAL_PRECISION_ROLLOUT=1 is not supported with speculative "
+            "decoding: draft forwards carry no base precision."
+        )
+    if vllm_config.cache_config.kv_sharing_fast_prefill:
+        raise NotImplementedError(
+            "VLLM_DUAL_PRECISION_ROLLOUT=1 is not supported with "
+            "kv_sharing_fast_prefill: the decoder-portion dispatch carries no "
+            "base precision."
+        )
+    if vllm_config.parallel_config.data_parallel_size > 1:
+        raise NotImplementedError(
+            "VLLM_DUAL_PRECISION_ROLLOUT=1 is not supported with data "
+            "parallelism: the precision is chosen per DP rank's scheduler and "
+            "is not synchronised across ranks."
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Config cloning and format validation                                         #
 # --------------------------------------------------------------------------- #

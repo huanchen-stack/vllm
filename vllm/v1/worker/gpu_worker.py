@@ -45,6 +45,7 @@ from vllm.distributed.weight_transfer import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.dual_precision import check_dual_precision_model_runner
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
@@ -313,6 +314,7 @@ class Worker(WorkerBase):
         init_workspace_manager(self.device, num_ubatches)
 
         # Construct the model runner
+        check_dual_precision_model_runner(self.vllm_config)
         if self.use_v2_model_runner:
             from vllm.v1.worker.gpu.model_runner import (
                 GPUModelRunner as GPUModelRunnerV2,
@@ -818,6 +820,7 @@ class Worker(WorkerBase):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     max_num_scheduled_tokens=num_scheduled_tokens_np.max(),
                     use_cascade_attn=False,  # TODO(lucas): Handle cascade attention
+                    base_precision=scheduler_output.dual_precision_base_precision,
                 )
             )
             all_gather_tensors = {

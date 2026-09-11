@@ -56,7 +56,9 @@ from vllm.forward_context import (
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.dual_precision import (
+    BASE_PRECISION_BF16,
     attach_dual_precision,
+    bind_dual_precision,
     dual_precision_rollout_enabled,
 )
 from vllm.model_executor.layers.attention import Attention, MLAAttention
@@ -903,6 +905,9 @@ class GPUModelRunner(
                 self.max_num_reqs, dtype=torch.int32
             )
         self.layerwise_nvtx_hooks_registered = False
+        # Dual precision (C2/C3): when enabled, the base weights are bound to
+        # the batch's precision before every forward and every graph capture.
+        self.dual_precision_enabled = dual_precision_rollout_enabled()
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -3746,6 +3751,7 @@ class GPUModelRunner(
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        base_precision: str | None = None,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -3779,9 +3785,11 @@ class GPUModelRunner(
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
             return self.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens,
+                num_reqs=num_reqs,
                 has_lora=has_lora,
                 uniform_decode=uniform_decode,
                 num_active_loras=num_active_loras,
+                base_precision=base_precision,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
             )
@@ -4077,6 +4085,7 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                base_precision=scheduler_output.dual_precision_base_precision,
             )
 
             logger.debug(
@@ -4217,6 +4226,10 @@ class GPUModelRunner(
         has_encoder_input = (
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
+
+        # Dual precision: select the base weights the scheduler asked for;
+        # the captured graph (if any) was recorded under the same binding.
+        self._bind_base_precision(scheduler_output.dual_precision_base_precision)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -5568,6 +5581,7 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        base_precision: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5680,6 +5694,9 @@ class GPUModelRunner(
                 # `force_num_active_loras` is used for cudagraph capture; because we
                 # need to capture graphs for specific num_active_loras counts
                 force_num_active_loras=num_active_loras,
+                # `base_precision` is used for cudagraph capture; the graph is
+                # keyed and recorded under the descriptor's base precision
+                base_precision=base_precision,
             )
         )
 
@@ -5826,6 +5843,8 @@ class GPUModelRunner(
                 num_tokens_padded = ubatch_slices_padded[0].num_tokens
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_padded
+
+            self._bind_base_precision(base_precision)
 
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
@@ -6315,49 +6334,54 @@ class GPUModelRunner(
             instance.graph_pool = profiling_pool
 
         set_cudagraph_capturing_enabled(True)
-        with self._freeze_gc(), graph_capture(device=self.device):
-            shared_memory_estimate = {}
-            per_graph_estimate = {}
-            torch.accelerator.synchronize()
-            torch.accelerator.empty_cache()
+        try:
+            with self._freeze_gc(), graph_capture(device=self.device):
+                shared_memory_estimate = {}
+                per_graph_estimate = {}
+                torch.accelerator.synchronize()
+                torch.accelerator.empty_cache()
 
-            for mode, descs in capture_descs:
-                profile_descs = descs[:2]
-                mem_samples: list[int] = []
+                for mode, descs in capture_descs:
+                    profile_descs = descs[:2]
+                    mem_samples: list[int] = []
 
-                for i, desc in enumerate(profile_descs):
-                    mem_before = torch.cuda.mem_get_info()[0]
-                    self._warmup_and_capture(
-                        desc,
-                        cudagraph_runtime_mode=mode,
-                        profile_seq_lens=(
-                            min(
-                                self.max_model_len,
-                                self.max_num_tokens // desc.num_tokens,
-                            )
-                            if mode == CUDAGraphMode.FULL and i == 0
-                            else None
-                        ),
+                    for i, desc in enumerate(profile_descs):
+                        mem_before = torch.cuda.mem_get_info()[0]
+                        self._warmup_and_capture(
+                            desc,
+                            cudagraph_runtime_mode=mode,
+                            profile_seq_lens=(
+                                min(
+                                    self.max_model_len,
+                                    self.max_num_tokens // desc.num_tokens,
+                                )
+                                if mode == CUDAGraphMode.FULL and i == 0
+                                else None
+                            ),
+                        )
+                        torch.accelerator.synchronize()
+                        free_after = torch.cuda.mem_get_info()[0]
+                        mem_samples.append(mem_before - free_after)
+
+                    first_capture = mem_samples[0]
+                    # Use at least 1 MiB per graph for driver overhead
+                    per_graph = max(
+                        mem_samples[1] if len(mem_samples) > 1 else 0, 1 << 20
                     )
-                    torch.accelerator.synchronize()
-                    free_after = torch.cuda.mem_get_info()[0]
-                    mem_samples.append(mem_before - free_after)
 
-                first_capture = mem_samples[0]
-                # Use at least 1 MiB per graph for driver overhead
-                per_graph = max(mem_samples[1] if len(mem_samples) > 1 else 0, 1 << 20)
+                    shared_memory_estimate[mode] = first_capture
+                    per_graph_estimate[mode] = per_graph * (len(descs) - 1)
 
-                shared_memory_estimate[mode] = first_capture
-                per_graph_estimate[mode] = per_graph * (len(descs) - 1)
-
-                logger.debug(
-                    "Estimated %s CUDA graph memory: "
-                    "%.2f MiB first-capture + (%d-1) × %.2f MiB per-graph",
-                    mode.name,
-                    first_capture / (1 << 20),
-                    len(descs),
-                    per_graph / (1 << 20),
-                )
+                    logger.debug(
+                        "Estimated %s CUDA graph memory: "
+                        "%.2f MiB first-capture + (%d-1) × %.2f MiB per-graph",
+                        mode.name,
+                        first_capture / (1 << 20),
+                        len(descs),
+                        per_graph / (1 << 20),
+                    )
+        finally:
+            self._restore_bf16_binding()
 
         set_cudagraph_capturing_enabled(False)
         CUDAGraphWrapper.clear_all_graphs()
@@ -6432,27 +6456,33 @@ class GPUModelRunner(
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
         set_cudagraph_capturing_enabled(True)
-        with self._freeze_gc(), graph_capture(device=self.device):
-            torch.accelerator.synchronize()
-            torch.accelerator.empty_cache()
-            start_free_gpu_memory = torch.cuda.mem_get_info()[0]
-
-            for (
-                runtime_mode,
-                batch_descs,
-            ) in self.cudagraph_dispatcher.get_capture_descs():
-                self._capture_cudagraphs(
-                    batch_descriptors=batch_descs,
-                    cudagraph_runtime_mode=runtime_mode,
-                )
+        try:
+            with self._freeze_gc(), graph_capture(device=self.device):
                 torch.accelerator.synchronize()
+                torch.accelerator.empty_cache()
+                start_free_gpu_memory = torch.cuda.mem_get_info()[0]
 
-            # Capture encoder CUDA graphs if enabled
-            if self.encoder_cudagraph_manager is not None:
-                self.encoder_cudagraph_manager.capture()
+                for (
+                    runtime_mode,
+                    batch_descs,
+                ) in self.cudagraph_dispatcher.get_capture_descs():
+                    self._capture_cudagraphs(
+                        batch_descriptors=batch_descs,
+                        cudagraph_runtime_mode=runtime_mode,
+                    )
+                    torch.accelerator.synchronize()
 
-            torch.accelerator.synchronize()
-            end_free_gpu_memory = torch.cuda.mem_get_info()[0]
+                # Capture encoder CUDA graphs if enabled
+                if self.encoder_cudagraph_manager is not None:
+                    self.encoder_cudagraph_manager.capture()
+
+                torch.accelerator.synchronize()
+                end_free_gpu_memory = torch.cuda.mem_get_info()[0]
+        finally:
+            # INT4 graphs were captured last for some shapes; leave the model
+            # bound to BF16 (the precision of every step until the scheduler
+            # switches, and of every forward that carries no precision).
+            self._restore_bf16_binding()
 
         # Disable cudagraph capturing globally, so any unexpected cudagraph
         # capturing will be detected and raise an error after here.
@@ -6479,6 +6509,23 @@ class GPUModelRunner(
         )
         return cuda_graph_size
 
+    def _bind_base_precision(self, base_precision: str | None) -> None:
+        """Dual precision (C3): bind the LoRA wrappers' base weights to
+        ``base_precision`` before a forward. ``None`` (no scheduler policy, or
+        a caller that never carries a precision) binds nothing; a vanilla
+        tree never reaches the bind call."""
+        if base_precision is None or not self.dual_precision_enabled:
+            return
+        bind_dual_precision(
+            self.get_model(),
+            base_precision,
+            self.compilation_config.static_forward_context,
+        )
+
+    def _restore_bf16_binding(self) -> None:
+        if self.dual_precision_enabled:
+            self._bind_base_precision(BASE_PRECISION_BF16)
+
     def _warmup_and_capture(
         self,
         desc: BatchDescriptor,
@@ -6501,6 +6548,7 @@ class GPUModelRunner(
                 remove_lora=False,
                 num_active_loras=desc.num_active_loras,
                 profile_seq_lens=profile_seq_lens,
+                base_precision=desc.base_precision,
             )
         self._dummy_run(
             desc.num_tokens,
@@ -6512,6 +6560,7 @@ class GPUModelRunner(
             num_active_loras=desc.num_active_loras,
             is_graph_capturing=True,
             profile_seq_lens=profile_seq_lens,
+            base_precision=desc.base_precision,
         )
 
     def _capture_cudagraphs(
