@@ -203,10 +203,12 @@ class CudagraphDispatcher:
     ) -> None:
         """Register the BF16 key and, under dual precision, its INT4 twin.
 
-        The INT4 shadow binds LoRA wrappers only, so twins exist for LoRA
-        keys and only up to ``int4_capture_max_batch`` (the policy's
-        ``capture_max_batch``): the switch to INT4 happens in the long tail
-        with few live requests, and large prefill graphs are not doubled.
+        Twins are registered for LoRA batches only (the INT4 shadow binds
+        LoRA wrappers) and only up to ``int4_capture_max_batch`` (the
+        policy's ``capture_max_batch``): the switch to INT4 happens in the
+        long tail with few live requests, and large prefill graphs are not
+        doubled. A batch with no active adapter during an INT4 step runs
+        eager with a once-per-key warning.
         """
         self.add_cudagraph_key(runtime_mode, batch_descriptor)
         ceiling = self.int4_capture_max_batch
@@ -360,9 +362,13 @@ class CudagraphDispatcher:
                 f"Unsupported base precision override: {base_precision!r} "
                 f"(expected one of {BASE_PRECISIONS})"
             )
-        eager_desc = BatchDescriptor(
-            num_tokens, num_reqs=num_reqs, base_precision=precision
-        )
+
+        def eager() -> tuple[CUDAGraphMode, BatchDescriptor]:
+            # Built only at the NONE return sites: the graph-hit path
+            # allocates nothing beyond vanilla.
+            return CUDAGraphMode.NONE, BatchDescriptor(
+                num_tokens, num_reqs=num_reqs, base_precision=precision
+            )
 
         if (
             not self.keys_initialized
@@ -371,7 +377,7 @@ class CudagraphDispatcher:
             or num_tokens > max_size
             or allowed_modes <= {CUDAGraphMode.NONE}
         ):
-            return CUDAGraphMode.NONE, eager_desc
+            return eager()
 
         effective_num_active_loras = num_active_loras
         if has_lora and num_active_loras > 0:
@@ -431,7 +437,7 @@ class CudagraphDispatcher:
                     num_reqs,
                     precision,
                 )
-        return CUDAGraphMode.NONE, eager_desc
+        return eager()
 
     def get_capture_descs(self) -> list[tuple[CUDAGraphMode, list[BatchDescriptor]]]:
         """

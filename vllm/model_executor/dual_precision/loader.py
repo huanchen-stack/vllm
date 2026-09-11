@@ -94,10 +94,21 @@ def check_dual_precision_model_runner(vllm_config: VllmConfig) -> None:
     step; fail at worker init instead. Speculative decoding, the KV-sharing
     fast-prefill path and data parallelism dispatch extra forwards with
     descriptors that carry no precision (implicitly BF16) or choose the
-    precision per DP rank, so they are refused as well. No-op when the
-    feature is off.
+    precision per DP rank, so they are refused as well.
+
+    With the feature off, a configured ``VLLM_DUAL_PRECISION_POLICY`` on a
+    LoRA-enabled engine is refused too: the scheduler would publish ``int4``
+    with no shadow attached and every post-switch step would run eager.
+    Without a LoRA config nothing could ever bind, so the scheduler-only
+    smokes (C4, C7) may set a policy alone.
     """
     if not dual_precision_rollout_enabled():
+        if envs.VLLM_DUAL_PRECISION_POLICY and vllm_config.lora_config is not None:
+            raise NotImplementedError(
+                "VLLM_DUAL_PRECISION_POLICY requires VLLM_DUAL_PRECISION_ROLLOUT=1 "
+                "on a LoRA-enabled engine: without the INT4 shadow the "
+                "scheduler's int4 steps would have no graph and run eager."
+            )
         return
     if vllm_config.use_v2_model_runner:
         raise NotImplementedError(

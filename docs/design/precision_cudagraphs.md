@@ -57,8 +57,9 @@ min(policy.capture_max_batch,          otherwise (policy loaded through C5's
 
 Every key goes through `_add_precision_cudagraph_keys`: the BF16 key is
 always added; an INT4 twin is added when the ceiling is set, the key has
-`has_lora=True` (the shadow binds LoRA wrappers only, so a no-LoRA batch
-has nothing to switch) and `num_tokens <= ceiling`. This applies to the
+`has_lora=True` and `num_tokens <= ceiling`. Twins are registered for LoRA
+batches only (the INT4 shadow binds LoRA wrappers); a batch with no active
+adapter during an INT4 step runs eager with a once-per-key warning. This applies to the
 mixed-batch keys (PIECEWISE or FULL) and to the uniform-decode FULL keys
 alike, for every policy kind: the experimental static-threshold path
 captured one precision per size (INT4 below the threshold, BF16 above) and
@@ -165,7 +166,12 @@ path is reached.
 * data parallelism: the precision is chosen per DP rank's scheduler and
   `coordinate_batch_across_dp` does not synchronise it.
 
-None of the project's models or archived runs use any of these.
+None of the project's models or archived runs use any of these. With the
+feature *off*, a non-empty `VLLM_DUAL_PRECISION_POLICY` on a LoRA-enabled
+engine is refused as well (the scheduler would publish `int4` with no
+shadow, and every post-switch step would run eager); without a LoRA config
+nothing could bind, so the scheduler-only smokes (C4, C7) may set a policy
+alone.
 
 ## Knobs and defaults
 

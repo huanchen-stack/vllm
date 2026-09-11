@@ -530,9 +530,11 @@ def _engine_config(
     spec_decode: bool = False,
     fast_prefill: bool = False,
     dp: int = 1,
+    lora: bool = False,
 ) -> MagicMock:
     config = MagicMock(spec=VllmConfig)
     config.use_v2_model_runner = use_v2
+    config.lora_config = headline_lora() if lora else None
     config.speculative_config = MagicMock() if spec_decode else None
     config.cache_config = MagicMock()
     config.cache_config.kv_sharing_fast_prefill = fast_prefill
@@ -550,6 +552,20 @@ def test_v2_model_runner_guard(dual_precision_env):
     dual_precision_env(enabled=False)
     check_dual_precision_model_runner(_engine_config(use_v2=True))
     check_dual_precision_model_runner(_engine_config())
+
+
+def test_policy_without_rollout_is_refused_on_a_lora_engine(dual_precision_env):
+    """Feature off + policy set: the scheduler would publish int4 with no
+    shadow attached. Refused only when LoRA is configured; the
+    scheduler-only smokes set a policy on a plain engine."""
+    dual_precision_env(enabled=False, policy="fixed_frontier:8000")
+    with pytest.raises(NotImplementedError, match="requires VLLM_DUAL_PRECISION"):
+        check_dual_precision_model_runner(_engine_config(lora=True))
+    check_dual_precision_model_runner(_engine_config(lora=False))
+    dual_precision_env(enabled=False, policy="")
+    check_dual_precision_model_runner(_engine_config(lora=True))
+    dual_precision_env(enabled=True, policy="fixed_frontier:8000")
+    check_dual_precision_model_runner(_engine_config(lora=True))
 
 
 @pytest.mark.parametrize(
