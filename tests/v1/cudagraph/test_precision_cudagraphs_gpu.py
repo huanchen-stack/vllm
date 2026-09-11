@@ -33,6 +33,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.utils import create_new_process_for_each_test
+
 pytestmark = pytest.mark.gpu_smoke
 
 if not torch.cuda.is_available():
@@ -60,7 +62,15 @@ CAPTURE_LOG_RE = re.compile(
 FALLBACK_WARNING = "No matching dynamic-precision CUDA graph"
 
 
-def _gpu_smoke_requested(request) -> None:
+@pytest.fixture
+def gpu_smoke_gate(request) -> None:
+    """Skip unless the gpu_smoke tier was requested under the launcher.
+
+    A fixture (evaluated in the pytest process) because the tests below run
+    in a spawned child, where the ``request`` object is not available; each
+    test gets its own process so the CUDA-graph pools of one test (or of the
+    vanilla wrapper tests in the same session) cannot leak into the next.
+    """
     markexpr = request.config.getoption("-m", default="") or ""
     if "gpu_smoke" not in markexpr and os.environ.get("PS_RUN_GPU_SMOKE") != "1":
         pytest.skip("gpu_smoke tier: run with -m gpu_smoke under run_gpu.sh")
@@ -73,8 +83,8 @@ def _gpu_smoke_requested(request) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_wrapper_captures_one_graph_per_precision_for_the_same_shape(request):
-    _gpu_smoke_requested(request)
+@create_new_process_for_each_test("spawn")
+def test_wrapper_captures_one_graph_per_precision_for_the_same_shape(gpu_smoke_gate):
     from tests.model_executor.dual_precision.fakes import (
         build_int4_model,
         build_wrapped_model,
@@ -233,8 +243,8 @@ def _coherent(text: str) -> bool:
     return most_common <= len(words) // 3 and ascii_ratio > 0.9
 
 
-def test_engine_switch_replays_captured_int4_graphs(request, tmp_path: Path):
-    _gpu_smoke_requested(request)
+@create_new_process_for_each_test("spawn")
+def test_engine_switch_replays_captured_int4_graphs(gpu_smoke_gate, tmp_path: Path):
     for path in (QWEN35_9B_BF16, QWEN35_9B_AUTOROUND):
         if not Path(path).is_dir():
             pytest.skip(f"checkpoint not available: {path}")
