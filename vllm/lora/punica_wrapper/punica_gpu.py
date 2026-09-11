@@ -115,7 +115,6 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         self._rollout_single_lora_index: int | None = None
         self._rollout_fast_path_logged = False
         self._rollout_fallback_logged = False
-        self._rollout_fallback_ids: list[int] = []
         # Punica kernel metadata (LoRAKernelMeta.prepare_tensors) contains a
         # device-to-host sync (torch.all -> host bool) plus sort/unique
         # kernels. On the fast path it is prepared lazily, only if a Punica
@@ -164,13 +163,27 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             self._rollout_single_lora_index = select_rollout_single_lora_index(
                 mapping.index_mapping, lora_index_to_id, self.max_loras
             )
-            if (
-                self._rollout_single_lora_index is None
-                and not self._rollout_fallback_logged
-            ):
-                # Diagnostics for the (one-time) fallback warning, computed
-                # on the host side only while it has not been logged yet.
-                self._rollout_fallback_ids = sorted(set(mapping.index_mapping))[:8]
+            # Log the first decision of each kind here, outside the compiled
+            # forward (Dynamo drops logger calls it traces through).
+            if self._rollout_single_lora_index is None:
+                if not self._rollout_fallback_logged:
+                    self._rollout_fallback_logged = True
+                    logger.warning(
+                        "Rollout QLoRA fast path fallback to Punica: "
+                        "token_lora_ids=%s, lora_index_to_id=%s, tokens=%s.",
+                        sorted(set(mapping.index_mapping))[:8],
+                        lora_index_to_id,
+                        len(mapping.index_mapping),
+                    )
+            elif not self._rollout_fast_path_logged:
+                self._rollout_fast_path_logged = True
+                logger.warning(
+                    "Rollout QLoRA torch path active: fused_packed=%s, "
+                    "lora_index=%s, tokens=%s.",
+                    self._rollout_fuse_packed,
+                    self._rollout_single_lora_index,
+                    len(mapping.index_mapping),
+                )
         else:
             self._rollout_single_lora_index = None
         if self._rollout_single_lora_index is None:
@@ -212,34 +225,13 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             rollout_lora_a_stacked is not None and rollout_lora_b_stacked is not None
         )
         if lora_index is None or (self._rollout_fuse_packed and not fuse_packed):
-            if not self._rollout_fallback_logged and not torch.compiler.is_compiling():
-                self._rollout_fallback_logged = True
-                logger.warning(
-                    "Rollout QLoRA fast path fallback to Punica: "
-                    "single_lora_index=%s, fuse_packed=%s, has_packed_buffers=%s, "
-                    "token_lora_ids=%s.",
-                    lora_index,
-                    self._rollout_fuse_packed,
-                    rollout_lora_a_stacked is not None,
-                    self._rollout_fallback_ids,
-                )
+            # Punica handles this call (multi-adapter batch, or a layer
+            # without packed buffers while fusion is requested).
             return False
 
         x = x.view(-1, x.shape[-1])
         y = y.view(-1, y.shape[-1])
         assert y.shape[-1] == sum(output_slices)
-        if not self._rollout_fast_path_logged and not torch.compiler.is_compiling():
-            self._rollout_fast_path_logged = True
-            logger.warning(
-                "Rollout QLoRA torch path active: fused_packed=%s, lora_index=%s, "
-                "slices=%s, tokens=%s, hidden=%s, output=%s.",
-                fuse_packed,
-                lora_index,
-                len(output_slices),
-                x.shape[0],
-                x.shape[-1],
-                y.shape[-1],
-            )
 
         if fuse_packed:
             assert rollout_lora_a_stacked is not None

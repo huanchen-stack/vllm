@@ -325,12 +325,46 @@ def _run(args: argparse.Namespace) -> None:
     llm = LLM(**llm_kwargs)
     lora_request = LoRARequest("ablation_adapter", 1, str(args.adapter))
 
+    def fast_path_evidence() -> dict[str, Any]:
+        """In-process state of the Punica wrapper(s) after a generate().
+
+        `rollout_single_lora_index` is the slot chosen by the last
+        update_metadata (None = Punica); `punica_metadata_prepared` False means
+        no Punica entry point ran in the last step, i.e. the D2H sync was
+        skipped. Best effort: empty when the engine is out of process.
+        """
+        try:
+            core = llm.llm_engine.engine_core.engine_core  # type: ignore[attr-defined]
+            runner = core.model_executor.driver_worker.worker.model_runner
+            manager = runner.lora_manager._adapter_manager
+            wrappers = list(manager.punica_wrapper_mapping.values())
+        except AttributeError as exc:
+            return {"error": repr(exc)}
+        evidence = []
+        for w in wrappers:
+            evidence.append(
+                {
+                    "type": type(w).__name__,
+                    "fast_path_enabled": getattr(w, "_rollout_fast_path_enabled", None),
+                    "fuse_packed": getattr(w, "_rollout_fuse_packed", None),
+                    "rollout_single_lora_index": getattr(
+                        w, "_rollout_single_lora_index", None
+                    ),
+                    "punica_metadata_prepared": getattr(
+                        w, "_punica_metadata_prepared", None
+                    ),
+                    "fallback_logged": getattr(w, "_rollout_fallback_logged", None),
+                }
+            )
+        return {"punica_wrappers": evidence}
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("a", encoding="utf-8") as handle:
         for cell in cells:
             row = run_cell(llm, lora_request, cell)
             row.update(
                 {
+                    "fast_path_evidence": fast_path_evidence(),
                     "model": args.model,
                     "adapter": str(args.adapter),
                     "label": args.label,

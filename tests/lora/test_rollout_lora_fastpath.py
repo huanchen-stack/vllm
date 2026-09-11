@@ -449,8 +449,8 @@ def test_mixed_batch_falls_back_to_punica(dist_init, default_vllm_config, monkey
     mapping = LoRAMapping([LORA_ID] * 4 + [LORA_ID + 1] * 4, [LORA_ID, LORA_ID + 1])
     wrapper.update_metadata(mapping, id_to_index, MAX_LORAS, 512)
     assert wrapper._rollout_single_lora_index is None
-    out = lora(x)[0]
     assert wrapper._rollout_fallback_logged
+    out = lora(x)[0]
     expected = torch.cat(
         [_reference(base, x[:4], a_list, b_list), _reference(base, x[4:], a2, b2)]
     )
