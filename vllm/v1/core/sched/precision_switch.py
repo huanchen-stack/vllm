@@ -319,6 +319,18 @@ class RolloutPrecisionSwitcher:
         """Disarm and clear per-rollout state without touching the policy."""
         self._state = _RolloutState()
         self.decider.reset()
+        policy = self.policy
+        if (
+            policy.fixed_switch_frontier is not None
+            and not policy.receding_horizon_lookup
+        ):
+            # A fixed frontier needs no table observation to be known: seed
+            # the monotone commitment so ``fixed_frontier:K`` switches at K
+            # even when K is below the first scan-grid frontier (the table
+            # would otherwise only commit at the 250-token observation, i.e.
+            # switch at max(K, 250)). For K >= 250 the seeded value equals
+            # the first lookup, so archived behaviour is unchanged.
+            self.decider.committed_frontier = policy.fixed_switch_frontier
 
     def _reload_policy(self, next_rollout_index: int) -> None:
         try:

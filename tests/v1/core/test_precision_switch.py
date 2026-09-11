@@ -213,6 +213,31 @@ def test_fixed_frontier_latches_one_way_and_rearms_after_drain():
     assert [event.rollout_index for event in switcher.switches] == [1, 2]
 
 
+def test_fixed_frontier_below_the_scan_grid_switches_at_the_frontier(tmp_path):
+    """``fixed_frontier:32``: the commitment is seeded from the spec, so the
+    switch does not wait for the first 250-token table observation."""
+    switcher = _switcher("fixed_frontier:32")
+    live = _live(("a", 10, 0), ("b", 10, 0))
+    assert switcher.tick(_step(live)) == BF16
+    assert switcher.committed_frontier == 32
+    assert switcher.tick(_step(_live(("a", 10, 31), ("b", 10, 31)))) == BF16
+    assert switcher.tick(_step(_live(("a", 10, 32), ("b", 10, 31)))) == INT4
+    assert switcher.last_switch is not None
+    assert switcher.last_switch.applied_response_tokens == 32
+    # A JSON policy with fixed_switch_frontier behaves the same way.
+    raw = {
+        "schema_version": 6,
+        "scan_interval_tokens": 250,
+        "capture_max_batch": 32,
+        "fixed_switch_frontier": 100,
+        "offline_cost_model": {"response_cap": 2000},
+    }
+    switcher = _switcher(_write_policy(tmp_path, raw))
+    switcher.tick(_step(live))
+    assert switcher.committed_frontier == 100
+    assert switcher.tick(_step(_live(("a", 10, 100)))) == INT4
+
+
 def test_uniform_w4_is_int4_from_the_first_tick_and_never_reports_a_switch():
     switcher = _switcher("uniform_w4")
     assert switcher.tick(_step([], unfinished=0)) == INT4
