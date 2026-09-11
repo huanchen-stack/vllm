@@ -280,6 +280,12 @@ if TYPE_CHECKING:
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
+    VLLM_DUAL_PRECISION_ROLLOUT: bool = False
+    VLLM_DUAL_PRECISION_INT4_MODEL: str = ""
+    VLLM_DUAL_PRECISION_BF16_LAYERS: str = "first:3,last:3"
+    VLLM_DUAL_PRECISION_INT4_MODULES: str = "all"
+    VLLM_DUAL_PRECISION_VALIDATE_SHADOW: bool = False
+    VLLM_DUAL_PRECISION_VALIDATE_LIFECYCLE: bool = False
 
 
 def get_default_cache_root():
@@ -1982,6 +1988,43 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each entry is VAR_NAME or VAR_NAME:<suffix> (suffix appended to
     # RDMA device name). Must be set together with VLLM_GPU_NIC_PCIE_MAPPING.
     "VLLM_NIC_SELECTION_VARS": lambda: os.getenv("VLLM_NIC_SELECTION_VARS", ""),
+    # --- Dual-precision rollout residency (vllm/model_executor/dual_precision) ---
+    # Load a second, INT4 (GPTQ-packed) copy of the base model next to the
+    # BF16 weights and let every LoRA wrapper select one of them per forward.
+    # Default off: a vanilla tree with this flag unset behaves exactly as
+    # upstream.
+    "VLLM_DUAL_PRECISION_ROLLOUT": lambda: bool(
+        int(os.getenv("VLLM_DUAL_PRECISION_ROLLOUT", "0"))
+    ),
+    # Path/name of the GPTQ-packed INT4 checkpoint used as the shadow base
+    # model (Intel AutoRound ``auto_round:auto_gptq`` or compressed-tensors
+    # ``pack-quantized``). Required when VLLM_DUAL_PRECISION_ROLLOUT=1.
+    "VLLM_DUAL_PRECISION_INT4_MODEL": lambda: os.getenv(
+        "VLLM_DUAL_PRECISION_INT4_MODEL", ""
+    ),
+    # Transformer blocks that keep BF16 base weights even when the INT4 path
+    # is selected. Supports ``first:N``, ``last:N``, indices, ``a-b`` ranges
+    # (comma-separated) and ``none``.
+    "VLLM_DUAL_PRECISION_BF16_LAYERS": lambda: os.getenv(
+        "VLLM_DUAL_PRECISION_BF16_LAYERS", "first:3,last:3"
+    ),
+    # Quantized linear families eligible for the INT4 shadow path: ``all`` or
+    # ``mlp_only`` (gate/up/gate_up/down projections only; attention and
+    # architecture-specific projections stay BF16).
+    "VLLM_DUAL_PRECISION_INT4_MODULES": lambda: os.getenv(
+        "VLLM_DUAL_PRECISION_INT4_MODULES", "all"
+    ),
+    # Compare every attached INT4 linear against its BF16 twin on a random
+    # input at load time and log the worst cosine / relative RMSE.
+    "VLLM_DUAL_PRECISION_VALIDATE_SHADOW": lambda: bool(
+        int(os.getenv("VLLM_DUAL_PRECISION_VALIDATE_SHADOW", "0"))
+    ),
+    # Record fixed-input probes of the first attached INT4 linears at load
+    # time and re-check them at the first INT4 bind (after sleep/wake and
+    # weight sync) to prove the shadow store survived the lifecycle.
+    "VLLM_DUAL_PRECISION_VALIDATE_LIFECYCLE": lambda: bool(
+        int(os.getenv("VLLM_DUAL_PRECISION_VALIDATE_LIFECYCLE", "0"))
+    ),
 }
 
 
