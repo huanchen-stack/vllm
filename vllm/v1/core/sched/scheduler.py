@@ -116,6 +116,7 @@ class Scheduler(SchedulerInterface):
             self.precision_switcher = RolloutPrecisionSwitcher.from_settings(
                 envs.VLLM_DUAL_PRECISION_POLICY,
                 reload_each_rollout=envs.VLLM_DUAL_PRECISION_RELOAD_POLICY_EACH_ROLLOUT,
+                require_advance=envs.VLLM_DUAL_PRECISION_REQUIRE_POLICY_ADVANCE,
                 observations_path=envs.VLLM_DUAL_PRECISION_ONLINE_OBSERVATIONS,
             )
 
@@ -1808,12 +1809,15 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            if self.precision_switcher is not None:
+                # Before any scheduler-state mutation: a failed policy reload
+                # at a rollout boundary raises and must leave the scheduler
+                # untouched.
+                self.precision_switcher.on_new_request(request.request_id)
             if request.resumable:
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
-            if self.precision_switcher is not None:
-                self.precision_switcher.on_new_request(request.request_id)
             if self.connector is not None:
                 self.connector.on_new_request(request)
             if self.log_stats:

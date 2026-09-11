@@ -119,6 +119,9 @@ class SwitchEvent:
     policy_kind: str
     policy_revision: int
     cohort: tuple[CohortEntry, ...]
+    #: The reload before this rollout saw an unchanged revision (calibrator
+    #: lagged a boundary); the switch ran on the previous table.
+    policy_reload_lagged: bool = False
 
     def to_record(self) -> dict[str, Any]:
         """The switch-cohort JSONL record (schema below, additive over the
@@ -129,6 +132,7 @@ class SwitchEvent:
             "rollout_index": self.rollout_index,
             "policy_kind": self.policy_kind,
             "policy_revision": self.policy_revision,
+            "policy_reload_lagged": self.policy_reload_lagged,
             "trigger": {
                 "committed_frontier": self.committed_frontier,
                 "applied_response_tokens": self.applied_response_tokens,
@@ -188,6 +192,7 @@ class _RolloutState:
     watermark: int = 0
     switch: SwitchEvent | None = None
     observations: int = 0
+    reload_lagged: bool = False
 
 
 class RolloutPrecisionSwitcher:
@@ -213,6 +218,8 @@ class RolloutPrecisionSwitcher:
         self.forced_precision: str | None = None
         self.ticks = 0
         self.reloads: list[tuple[int, int]] = []
+        #: Boundaries (rollout >= 2) whose reload saw an unchanged revision.
+        self.policy_reload_lag_count = 0
         self.switches: list[SwitchEvent] = []
         self._state = _RolloutState()
 
@@ -222,13 +229,15 @@ class RolloutPrecisionSwitcher:
         policy_spec: str,
         *,
         reload_each_rollout: bool = False,
+        require_advance: bool = False,
         observations_path: str = "",
         log: Callable[..., None] | None = None,
     ) -> RolloutPrecisionSwitcher:
-        """Build from the decision-6 spec string and the two runtime knobs
-        (the scheduler passes ``envs.*`` values through; nothing here reads
-        the environment)."""
-        store = PolicyStore(policy_spec)
+        """Build from the decision-6 spec string and the runtime knobs (the
+        scheduler passes ``envs.*`` values through; nothing here reads the
+        environment).  ``require_advance`` is the strict fallback: fail
+        closed on an unchanged revision instead of logging a lag."""
+        store = PolicyStore(policy_spec, require_advance=require_advance)
         store.load()
         return cls(
             store,
@@ -303,11 +312,13 @@ class RolloutPrecisionSwitcher:
         store exempts that first reload from the advance check, and every
         later boundary must see a higher revision or fail closed.
         """
+        lagged = False
         if self.reload_each_rollout and self.store.spec.is_file:
-            self._reload_policy(self.rollout_index + 1)
+            lagged = self._reload_policy(self.rollout_index + 1)
         self.end_rollout()
         self.rollout_index += 1
         self._state.armed = True
+        self._state.reload_lagged = lagged
         self._log(
             "Precision rollout armed: rollout_index=%d, policy=%s, "
             "cohort_size=%s, revision=%d",
@@ -334,24 +345,38 @@ class RolloutPrecisionSwitcher:
             # the first lookup, so archived behaviour is unchanged.
             self.decider.committed_frontier = policy.fixed_switch_frontier
 
-    def _reload_policy(self, next_rollout_index: int) -> None:
+    def _reload_policy(self, next_rollout_index: int) -> bool:
+        """Reload once; returns True when the revision did not advance at a
+        boundary from rollout 2 on (calibrator lag).  With
+        ``store.require_advance`` that case raises instead (strict fallback);
+        an invalid file or a revision going backwards always raises."""
         try:
             self.store.reload()
         except PolicyRevisionError as error:
-            # Fail closed: a stale or invalid table must not drive the next
-            # rollout silently (the B128 continuous-EMA run kept switching on
-            # a frozen revision-14 table for 15 steps before anyone noticed).
             raise PolicyRevisionError(
                 f"policy reload before rollout {next_rollout_index} failed: {error}"
             ) from error
         if self.store.policy is not self.decider.policy:
             self.decider = PolicyDecider(self.store.policy)
-        self.reloads.append((next_rollout_index, self.policy.policy_revision))
+        revision = self.policy.policy_revision
+        self.reloads.append((next_rollout_index, revision))
+        lagged = next_rollout_index >= 2 and not self.store.last_reload_advanced
+        if lagged:
+            self.policy_reload_lag_count += 1
+            self._log(
+                "Precision policy reload lagged before rollout %d: revision=%d "
+                "unchanged (calibrator did not finish); running on the previous "
+                "table (lag_count=%d)",
+                next_rollout_index,
+                revision,
+                self.policy_reload_lag_count,
+            )
         self._log(
             "Reloaded dynamic precision policy before rollout %d: revision=%d",
             next_rollout_index,
-            self.policy.policy_revision,
+            revision,
         )
+        return lagged
 
     # ------------------------------------------------------------------ hooks
 
@@ -517,6 +542,7 @@ class RolloutPrecisionSwitcher:
             reason=decision.reason,
             policy_kind=self.policy.kind,
             policy_revision=self.policy.policy_revision,
+            policy_reload_lagged=self._state.reload_lagged,
             cohort=tuple(
                 CohortEntry(
                     request_id=request.request_id,
@@ -555,6 +581,8 @@ class RolloutPrecisionSwitcher:
             "cohort_size": self.cohort_size,
             "policy_kind": self.policy.kind,
             "policy_revision": self.policy.policy_revision,
+            "policy_reload_lagged": state.reload_lagged,
+            "policy_reload_lag_count": self.policy_reload_lag_count,
             "forced_precision": self.forced_precision,
             "base_precision": self.base_precision,
         }

@@ -77,7 +77,13 @@ Two arming modes, chosen by the policy:
   and the logged `applied_live_requests` use the actual live count. An
   empty scheduler never ends a cohort rollout (early finishers, streaming
   gaps), and a re-admitted resumable continuation carrying a known id is not
-  a new member. More than B new ids inside a cohort is a `RuntimeError`.
+  a new member. The (B+1)th new id is by definition the first member of the
+  next rollout (the experimental runtime behaved the same way; its
+  "cohort exceeded" error was unreachable). Caveat: every rollout the engine
+  sees, validation included, must submit exactly B new ids, otherwise cohort
+  boundaries drift for the rest of the run; and with reload enabled a
+  validation rollout is a boundary that consumes a policy reload. Size
+  validation batches to B or run them on a separate engine.
 * **Cohort-free arming** (inline specs; `initial_rollout_batch = None`,
   `arm_min_requests = 1`). The rollout arms at the first `tick` with at
   least `arm_min_requests` unfinished requests, `decision_live` is the
@@ -121,10 +127,14 @@ appends one record (`sort_keys`, one object per line, directory created):
 `requests[].entry_output_tokens` are the archived keys the calibrator reads
 (`verl/experimental/precision_scheduler/traces.py`: `read_cohorts`,
 `cohort_observation`, `resolve_request_id` strips the EngineCore `-<8 hex>`
-suffix). `prompt_tokens`, `trigger` and `policy_revision` are additive: they
-replace the experimental "Dynamic precision exact switch request states" log
-line (parsed by three archived plot scripts) and let an audit check which
-revision drove a switch. The same record is kept in memory
+suffix). The per-request key is `entry_output_tokens`; the final response
+length is not in the record, the calibrator joins it from the request
+lifetime traces (`generation_tokens`). `requests[].prompt_tokens`,
+`trigger`, `policy_kind`, `policy_revision` and `policy_reload_lagged`
+(the reload before this rollout saw an unchanged revision, see below) are
+additive: they replace the experimental "Dynamic precision exact switch
+request states" log line (parsed by three archived plot scripts) and let an
+audit check which revision drove a switch. The same record is kept in memory
 (`switcher.switches`, `last_switch`) for tests and tooling.
 
 The log line `Lookup dynamic full-cost switch: rollout_index=%d,
@@ -139,16 +149,31 @@ formats too.
 With `VLLM_DUAL_PRECISION_RELOAD_POLICY_EACH_ROLLOUT=1` and a file policy,
 `start_rollout` calls `PolicyStore.reload()` exactly once per boundary,
 rollout 1 included (the archived runs log `Reloaded ... before rollout 1:
-revision=0`; the store exempts that first reload from the advance check
-because the calibrator has not run yet), and fails closed from rollout 2 on:
-a `PolicyRevisionError` (unreadable or invalid file, revision not advanced,
-revision went backwards) propagates out of `add_request`, so a stale table
-cannot silently drive a rollout. The
-experimental runtime reloaded twice per boundary (`add_request` when empty
-plus the cohort boundary; 59 reloads for 29 boundaries in every Sep-8 run)
-and only logged exceptions; the B128/16K continuous-EMA run kept switching
-on a frozen revision-14 table for 15 steps (handoff section 9.6). Inline
-specs never reload.
+revision=0`). The reload is invoked from `on_new_request` before the
+scheduler registers the request, so a raise leaves scheduler state
+untouched. Three outcomes from rollout 2 on:
+
+* revision advanced: the new table is installed for this rollout;
+* revision unchanged (the calibrator lagged the boundary): by default a
+  warning is logged once per boundary, `switcher.policy_reload_lag_count`
+  is incremented and the rollout's cohort record carries
+  `policy_reload_lagged: true`; the rollout runs on the previous table. The
+  archived headline runs did lag occasionally (`b32_cap16384_ema_alpha_a000_30step`
+  before rollout 6, `ema_pair128_a010` before rollouts 6 and 22), so a hard
+  failure here would have aborted them;
+* invalid file or revision went backwards: `PolicyRevisionError` always.
+
+The primary lag protection is a verl-side barrier: the trainer waits for
+the calibrator's new revision before submitting the next rollout
+(config key `precision_scheduler.policy_barrier_timeout_s`, added by C8).
+`VLLM_DUAL_PRECISION_REQUIRE_POLICY_ADVANCE=1` is the strict fallback
+inside vLLM: an unchanged revision at a boundary from rollout 2 on raises
+(the store exempts the reload before rollout 1, where the calibrator has
+not run yet), so a stale table cannot silently drive a run the way the
+B128/16K continuous-EMA run kept switching on a frozen revision-14 table
+for 15 steps (handoff section 9.6). The experimental runtime reloaded twice
+per boundary (59 reloads for 29 boundaries in every Sep-8 run) and only
+logged exceptions. Inline specs never reload.
 
 ### Profiler seam
 
@@ -166,7 +191,8 @@ instead.
 |---|---|---|
 | `VLLM_DUAL_PRECISION_POLICY` | `""` | policy spec or JSON path; empty = switcher off, output field `None` |
 | `VLLM_DUAL_PRECISION_ONLINE_OBSERVATIONS` | `""` | switch-cohort JSONL path; empty = no file (records still kept in memory) |
-| `VLLM_DUAL_PRECISION_RELOAD_POLICY_EACH_ROLLOUT` | `0` | reload once per boundary, fail closed unless the revision advanced |
+| `VLLM_DUAL_PRECISION_RELOAD_POLICY_EACH_ROLLOUT` | `0` | reload once per boundary; unchanged revision = logged lag, recorded in the cohort JSONL |
+| `VLLM_DUAL_PRECISION_REQUIRE_POLICY_ADVANCE` | `0` | strict fallback: raise on an unchanged revision from rollout 2 on (verl's policy barrier is the primary mechanism) |
 
 Policy JSON fields the runtime honours: `scan_interval_tokens`,
 `initial_rollout_batch`, `arm_min_requests`, `receding_horizon_lookup`,
@@ -189,7 +215,10 @@ Policy JSON fields the runtime honours: `scan_interval_tokens`,
   verifies the signal and the file, not a weight change.
 - **C6 calibrator**: consumes the cohort JSONL (keys above), writes a new
   policy revision atomically before the next rollout's first request; the
-  switcher reloads it once and refuses to run on a stale revision.
+  switcher reloads it once, records a lag when it is late, and (strict
+  knob) refuses to run on a stale revision.
+- **C8 verl harness**: `precision_scheduler.policy_barrier_timeout_s` waits
+  for the calibrator's revision before submitting the next rollout.
 - **C7 re-prefill**: hooks after this component; it will move the response
   length to `num_visible_output_tokens` (re-prefill folds output into the
   prompt) by changing `Request.num_cumulative_output_tokens` only.
@@ -207,7 +236,7 @@ Policy JSON fields the runtime honours: `scan_interval_tokens`,
 | `lookup_hierarchy` branch | two policies built, never launched |
 | NVTX / nsys window code (`_nvtx_range_push/_pop`, `_dynamic_nsys_*`, three bridge blocks, the forced switch at iteration 3) | profiling scaffolding that altered switching; results archived under `nsight_*_20260823/` |
 | separate env-threshold latch, `threshold >= max_num_seqs` uniform trick | decision 6: `fixed_threshold:t` and `uniform_w4` through the one switcher, cohorts logged for every kind |
-| double reload per boundary, exception-swallowing reload | reload once, fail closed |
+| double reload per boundary, exception-swallowing reload | reload once; lag counted and recorded, strict fail-closed knob |
 | `dynamic_precision_peak_requests`, `last_prediction`, `last_context`, `Dynamic cost policy no-switch` log | only fed cost-model log lines |
 | "Dynamic precision exact switch request states" log line | superseded by `prompt_tokens` in the JSONL |
 
