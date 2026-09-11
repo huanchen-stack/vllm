@@ -197,7 +197,14 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         layer (QKV, gate-up, Qwen3.5 in_proj) becomes one ``x @ A^T @ B^T``
         GEMM pair.
         """
-        if not self._rollout_lora_enabled:
+        if (
+            not self._rollout_lora_enabled
+            or not current_platform.is_cuda_alike()
+            or self.lora_config.fully_sharded_loras
+        ):
+            # The fast path lives in PunicaWrapperGPU and is gated off for
+            # fully sharded LoRA there as well; do not allocate what it
+            # would never read.
             self.rollout_lora_a_stacked = None
             self.rollout_lora_b_stacked = None
             return
