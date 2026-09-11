@@ -1,0 +1,706 @@
+{
+  "sample_count": 87,
+  "match_count": 87,
+  "mismatches": [],
+  "direct_seconds": 40.468390587950125,
+  "lookup_100k_seconds": 0.10842999792657793,
+  "lookup_mean_microseconds": 1.0842999792657793,
+  "rows": [
+    {
+      "frontier": 20500,
+      "live_batch": 128,
+      "prompt_bucket": 512,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 9500,
+      "live_batch": 15,
+      "prompt_bucket": 1152,
+      "direct": 9750,
+      "lookup": 9750,
+      "match": true
+    },
+    {
+      "frontier": 20000,
+      "live_batch": 70,
+      "prompt_bucket": 1152,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 5000,
+      "live_batch": 100,
+      "prompt_bucket": 0,
+      "direct": 16250,
+      "lookup": 16250,
+      "match": true
+    },
+    {
+      "frontier": 19250,
+      "live_batch": 114,
+      "prompt_bucket": 1280,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 250,
+      "live_batch": 48,
+      "prompt_bucket": 1536,
+      "direct": 2000,
+      "lookup": 2000,
+      "match": true
+    },
+    {
+      "frontier": 16000,
+      "live_batch": 36,
+      "prompt_bucket": 1920,
+      "direct": 17750,
+      "lookup": 17750,
+      "match": true
+    },
+    {
+      "frontier": 17250,
+      "live_batch": 51,
+      "prompt_bucket": 1920,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 14750,
+      "live_batch": 108,
+      "prompt_bucket": 128,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 3750,
+      "live_batch": 60,
+      "prompt_bucket": 2048,
+      "direct": 9750,
+      "lookup": 9750,
+      "match": true
+    },
+    {
+      "frontier": 4000,
+      "live_batch": 16,
+      "prompt_bucket": 256,
+      "direct": 8500,
+      "lookup": 8500,
+      "match": true
+    },
+    {
+      "frontier": 7250,
+      "live_batch": 75,
+      "prompt_bucket": 256,
+      "direct": 16250,
+      "lookup": 16250,
+      "match": true
+    },
+    {
+      "frontier": 2250,
+      "live_batch": 27,
+      "prompt_bucket": 1408,
+      "direct": 9000,
+      "lookup": 9000,
+      "match": true
+    },
+    {
+      "frontier": 4500,
+      "live_batch": 71,
+      "prompt_bucket": 896,
+      "direct": 9750,
+      "lookup": 9750,
+      "match": true
+    },
+    {
+      "frontier": 11250,
+      "live_batch": 83,
+      "prompt_bucket": 1536,
+      "direct": 21000,
+      "lookup": 21000,
+      "match": true
+    },
+    {
+      "frontier": 13500,
+      "live_batch": 7,
+      "prompt_bucket": 1408,
+      "direct": 15250,
+      "lookup": 15250,
+      "match": true
+    },
+    {
+      "frontier": 20250,
+      "live_batch": 3,
+      "prompt_bucket": 1792,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 22750,
+      "live_batch": 93,
+      "prompt_bucket": 1536,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 13000,
+      "live_batch": 125,
+      "prompt_bucket": 1920,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 4750,
+      "live_batch": 104,
+      "prompt_bucket": 1280,
+      "direct": 16250,
+      "lookup": 16250,
+      "match": true
+    },
+    {
+      "frontier": 4750,
+      "live_batch": 64,
+      "prompt_bucket": 0,
+      "direct": 9750,
+      "lookup": 9750,
+      "match": true
+    },
+    {
+      "frontier": 2000,
+      "live_batch": 95,
+      "prompt_bucket": 1024,
+      "direct": 10000,
+      "lookup": 10000,
+      "match": true
+    },
+    {
+      "frontier": 22750,
+      "live_batch": 23,
+      "prompt_bucket": 1664,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 8000,
+      "live_batch": 30,
+      "prompt_bucket": 1408,
+      "direct": 9750,
+      "lookup": 9750,
+      "match": true
+    },
+    {
+      "frontier": 20250,
+      "live_batch": 69,
+      "prompt_bucket": 1920,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 6000,
+      "live_batch": 84,
+      "prompt_bucket": 1664,
+      "direct": 16250,
+      "lookup": 16250,
+      "match": true
+    },
+    {
+      "frontier": 17500,
+      "live_batch": 41,
+      "prompt_bucket": 1408,
+      "direct": 20750,
+      "lookup": 20750,
+      "match": true
+    },
+    {
+      "frontier": 7500,
+      "live_batch": 62,
+      "prompt_bucket": 768,
+      "direct": 16250,
+      "lookup": 16250,
+      "match": true
+    },
+    {
+      "frontier": 250,
+      "live_batch": 114,
+      "prompt_bucket": 1792,
+      "direct": 8250,
+      "lookup": 8250,
+      "match": true
+    },
+    {
+      "frontier": 15750,
+      "live_batch": 21,
+      "prompt_bucket": 768,
+      "direct": 16250,
+      "lookup": 16250,
+      "match": true
+    },
+    {
+      "frontier": 12250,
+      "live_batch": 53,
+      "prompt_bucket": 512,
+      "direct": 16250,
+      "lookup": 16250,
+      "match": true
+    },
+    {
+      "frontier": 10250,
+      "live_batch": 70,
+      "prompt_bucket": 256,
+      "direct": 16500,
+      "lookup": 16500,
+      "match": true
+    },
+    {
+      "frontier": 5500,
+      "live_batch": 110,
+      "prompt_bucket": 768,
+      "direct": 16500,
+      "lookup": 16500,
+      "match": true
+    },
+    {
+      "frontier": 6500,
+      "live_batch": 122,
+      "prompt_bucket": 768,
+      "direct": 16250,
+      "lookup": 16250,
+      "match": true
+    },
+    {
+      "frontier": 6500,
+      "live_batch": 62,
+      "prompt_bucket": 512,
+      "direct": 16250,
+      "lookup": 16250,
+      "match": true
+    },
+    {
+      "frontier": 10500,
+      "live_batch": 26,
+      "prompt_bucket": 1920,
+      "direct": 16250,
+      "lookup": 16250,
+      "match": true
+    },
+    {
+      "frontier": 10750,
+      "live_batch": 12,
+      "prompt_bucket": 2048,
+      "direct": 11000,
+      "lookup": 11000,
+      "match": true
+    },
+    {
+      "frontier": 18500,
+      "live_batch": 73,
+      "prompt_bucket": 2048,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 11750,
+      "live_batch": 60,
+      "prompt_bucket": 0,
+      "direct": 17000,
+      "lookup": 17000,
+      "match": true
+    },
+    {
+      "frontier": 22250,
+      "live_batch": 127,
+      "prompt_bucket": 2048,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 12250,
+      "live_batch": 7,
+      "prompt_bucket": 768,
+      "direct": 12750,
+      "lookup": 12750,
+      "match": true
+    },
+    {
+      "frontier": 22500,
+      "live_batch": 56,
+      "prompt_bucket": 1536,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 5000,
+      "live_batch": 105,
+      "prompt_bucket": 2048,
+      "direct": 16000,
+      "lookup": 16000,
+      "match": true
+    },
+    {
+      "frontier": 16000,
+      "live_batch": 10,
+      "prompt_bucket": 1920,
+      "direct": 16500,
+      "lookup": 16500,
+      "match": true
+    },
+    {
+      "frontier": 5250,
+      "live_batch": 62,
+      "prompt_bucket": 640,
+      "direct": 11500,
+      "lookup": 11500,
+      "match": true
+    },
+    {
+      "frontier": 15000,
+      "live_batch": 20,
+      "prompt_bucket": 1536,
+      "direct": 16250,
+      "lookup": 16250,
+      "match": true
+    },
+    {
+      "frontier": 9500,
+      "live_batch": 88,
+      "prompt_bucket": 768,
+      "direct": 18500,
+      "lookup": 18500,
+      "match": true
+    },
+    {
+      "frontier": 15750,
+      "live_batch": 95,
+      "prompt_bucket": 2048,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 5500,
+      "live_batch": 119,
+      "prompt_bucket": 512,
+      "direct": 16250,
+      "lookup": 16250,
+      "match": true
+    },
+    {
+      "frontier": 10750,
+      "live_batch": 122,
+      "prompt_bucket": 128,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 19750,
+      "live_batch": 9,
+      "prompt_bucket": 1152,
+      "direct": 19750,
+      "lookup": 19750,
+      "match": true
+    },
+    {
+      "frontier": 22750,
+      "live_batch": 53,
+      "prompt_bucket": 256,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 12500,
+      "live_batch": 22,
+      "prompt_bucket": 1920,
+      "direct": 16250,
+      "lookup": 16250,
+      "match": true
+    },
+    {
+      "frontier": 7500,
+      "live_batch": 81,
+      "prompt_bucket": 896,
+      "direct": 16500,
+      "lookup": 16500,
+      "match": true
+    },
+    {
+      "frontier": 8750,
+      "live_batch": 125,
+      "prompt_bucket": 256,
+      "direct": 22000,
+      "lookup": 22000,
+      "match": true
+    },
+    {
+      "frontier": 13500,
+      "live_batch": 128,
+      "prompt_bucket": 896,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 1250,
+      "live_batch": 62,
+      "prompt_bucket": 0,
+      "direct": 7500,
+      "lookup": 7500,
+      "match": true
+    },
+    {
+      "frontier": 21750,
+      "live_batch": 67,
+      "prompt_bucket": 1280,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 20250,
+      "live_batch": 48,
+      "prompt_bucket": 1664,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 1250,
+      "live_batch": 3,
+      "prompt_bucket": 1280,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 12500,
+      "live_batch": 102,
+      "prompt_bucket": 256,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 17250,
+      "live_batch": 23,
+      "prompt_bucket": 384,
+      "direct": 17250,
+      "lookup": 17250,
+      "match": true
+    },
+    {
+      "frontier": 8500,
+      "live_batch": 110,
+      "prompt_bucket": 1280,
+      "direct": 19000,
+      "lookup": 19000,
+      "match": true
+    },
+    {
+      "frontier": 750,
+      "live_batch": 31,
+      "prompt_bucket": 1536,
+      "direct": 1500,
+      "lookup": 1500,
+      "match": true
+    },
+    {
+      "frontier": 18750,
+      "live_batch": 105,
+      "prompt_bucket": 384,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 17250,
+      "live_batch": 7,
+      "prompt_bucket": 128,
+      "direct": 17250,
+      "lookup": 17250,
+      "match": true
+    },
+    {
+      "frontier": 10500,
+      "live_batch": 90,
+      "prompt_bucket": 1664,
+      "direct": 21000,
+      "lookup": 21000,
+      "match": true
+    },
+    {
+      "frontier": 21250,
+      "live_batch": 34,
+      "prompt_bucket": 512,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 3000,
+      "live_batch": 40,
+      "prompt_bucket": 256,
+      "direct": 7500,
+      "lookup": 7500,
+      "match": true
+    },
+    {
+      "frontier": 2250,
+      "live_batch": 102,
+      "prompt_bucket": 1920,
+      "direct": 9750,
+      "lookup": 9750,
+      "match": true
+    },
+    {
+      "frontier": 20500,
+      "live_batch": 84,
+      "prompt_bucket": 384,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 7500,
+      "live_batch": 116,
+      "prompt_bucket": 256,
+      "direct": 17000,
+      "lookup": 17000,
+      "match": true
+    },
+    {
+      "frontier": 21750,
+      "live_batch": 53,
+      "prompt_bucket": 1408,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 6250,
+      "live_batch": 30,
+      "prompt_bucket": 384,
+      "direct": 8250,
+      "lookup": 8250,
+      "match": true
+    },
+    {
+      "frontier": 23000,
+      "live_batch": 26,
+      "prompt_bucket": 256,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 10000,
+      "live_batch": 88,
+      "prompt_bucket": 768,
+      "direct": 19000,
+      "lookup": 19000,
+      "match": true
+    },
+    {
+      "frontier": 1250,
+      "live_batch": 1,
+      "prompt_bucket": 512,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    },
+    {
+      "frontier": 5750,
+      "live_batch": 93,
+      "prompt_bucket": 1152,
+      "direct": 16500,
+      "lookup": 16500,
+      "match": true
+    },
+    {
+      "frontier": 1250,
+      "live_batch": 93,
+      "prompt_bucket": 1664,
+      "direct": 8500,
+      "lookup": 8500,
+      "match": true
+    },
+    {
+      "frontier": 2000,
+      "live_batch": 112,
+      "prompt_bucket": 896,
+      "direct": 9750,
+      "lookup": 9750,
+      "match": true
+    },
+    {
+      "frontier": 250,
+      "live_batch": 128,
+      "prompt_bucket": 128,
+      "direct": 8500,
+      "lookup": 8500,
+      "match": true
+    },
+    {
+      "frontier": 500,
+      "live_batch": 128,
+      "prompt_bucket": 128,
+      "direct": 8500,
+      "lookup": 8500,
+      "match": true
+    },
+    {
+      "frontier": 2000,
+      "live_batch": 64,
+      "prompt_bucket": 128,
+      "direct": 8500,
+      "lookup": 8500,
+      "match": true
+    },
+    {
+      "frontier": 7500,
+      "live_batch": 20,
+      "prompt_bucket": 128,
+      "direct": 8500,
+      "lookup": 8500,
+      "match": true
+    },
+    {
+      "frontier": 8250,
+      "live_batch": 16,
+      "prompt_bucket": 128,
+      "direct": 8500,
+      "lookup": 8500,
+      "match": true
+    },
+    {
+      "frontier": 12000,
+      "live_batch": 4,
+      "prompt_bucket": 128,
+      "direct": 12000,
+      "lookup": 12000,
+      "match": true
+    },
+    {
+      "frontier": 24500,
+      "live_batch": 1,
+      "prompt_bucket": 2048,
+      "direct": null,
+      "lookup": null,
+      "match": true
+    }
+  ]
+}
