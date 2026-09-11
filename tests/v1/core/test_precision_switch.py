@@ -557,9 +557,10 @@ def test_switch_cohort_jsonl_round_trips_through_the_watcher_parser(tmp_path):
 
 
 def test_reload_once_per_boundary_and_fail_closed_on_stale_revision(tmp_path):
+    """Strict mode (VLLM_DUAL_PRECISION_REQUIRE_POLICY_ADVANCE=1)."""
     raw = _fixed_frontier_json(1000, batch=2, calibration={"policy_revision": 0})
     path = _write_policy(tmp_path, raw)
-    switcher = _switcher(path, reload_each_rollout=True)
+    switcher = _switcher(path, reload_each_rollout=True, require_advance=True)
     switcher.on_new_request("a")
     switcher.on_new_request("b")
     # Before rollout 1 the file is re-read as is (the calibrator has not run).
@@ -586,7 +587,7 @@ def test_reload_once_per_boundary_and_fail_closed_on_stale_revision(tmp_path):
     # A stale revision at the FIRST boundary after rollout 1 fails too: only
     # the reload before rollout 1 is exempt.
     stale_path = _write_policy(tmp_path, raw, "stale.json")
-    stale = _switcher(stale_path, reload_each_rollout=True)
+    stale = _switcher(stale_path, reload_each_rollout=True, require_advance=True)
     stale.on_new_request("a")
     stale.on_new_request("b")
     assert stale.reloads == [(1, 0)]
@@ -598,6 +599,48 @@ def test_reload_once_per_boundary_and_fail_closed_on_stale_revision(tmp_path):
     inline.tick(_step([], unfinished=0))
     inline.tick(_step(_live(("b", 10, 0))))
     assert inline.rollout_index == 2 and inline.reloads == []
+
+
+def test_reload_lag_is_logged_and_recorded_when_not_strict(tmp_path):
+    """Default mode: an unchanged revision at a boundary (rollout >= 2) is a
+    logged lag, counted on the switcher and flagged in the cohort record
+    (the archived a000 run lagged before rollout 6; ema_pair128_a010 before
+    rollouts 6 and 22). Backwards revisions and invalid files still raise."""
+    raw = _fixed_frontier_json(1000, batch=1, calibration={"policy_revision": 0})
+    path = _write_policy(tmp_path, raw)
+    cohorts = tmp_path / "cohorts.jsonl"
+    logged: list[str] = []
+    switcher = RolloutPrecisionSwitcher.from_settings(
+        path,
+        reload_each_rollout=True,
+        require_advance=False,
+        observations_path=str(cohorts),
+        log=lambda fmt, *args: logged.append(fmt % args),
+    )
+    switcher.on_new_request("a")  # rollout 1: reload sees 0 == 0, not a lag
+    assert switcher.policy_reload_lag_count == 0
+    _write_policy(tmp_path, dict(raw, calibration={"policy_revision": 1}))
+    switcher.on_new_request("b")  # rollout 2: advanced
+    assert switcher.policy_reload_lag_count == 0
+    switcher.on_new_request("c")  # rollout 3: 1 == 1 -> lag
+    assert switcher.policy_reload_lag_count == 1
+    assert switcher.reloads == [(1, 0), (2, 1), (3, 1)]
+    assert sum("reload lagged before rollout 3" in line for line in logged) == 1
+    assert switcher.tick(_step(_live(("c", 10, 1000)))) == INT4
+    record = _watcher_read_cohorts(cohorts)[-1]
+    assert record["rollout_index"] == 3
+    assert record["policy_reload_lagged"] is True
+    assert record["policy_revision"] == 1
+    _write_policy(tmp_path, dict(raw, calibration={"policy_revision": 2}))
+    switcher.on_new_request("d")  # rollout 4: advanced again, flag clears
+    assert switcher.policy_reload_lag_count == 1
+    assert switcher.tick(_step(_live(("d", 10, 1000)))) == INT4
+    assert _watcher_read_cohorts(cohorts)[-1]["policy_reload_lagged"] is False
+    # Backwards revision always fails closed.
+    _write_policy(tmp_path, dict(raw, calibration={"policy_revision": 0}))
+    with pytest.raises(PolicyRevisionError):
+        switcher.on_new_request("e")
+    assert switcher.describe()["policy_reload_lag_count"] == 1
 
 
 def test_reload_disabled_keeps_the_loaded_policy(tmp_path):
@@ -935,3 +978,35 @@ def test_golden_replay_fixed_frontier8000_b32_cap16384_30step():
     parsed from the ``exact switch request states`` log lines (the run never
     set the observations path)."""
     _replay_golden("b32_cap16384_fixed_frontier8000_30step", entry_tolerance=4)
+
+
+def test_golden_inline_fixed_frontier8000_matches_the_file_policy():
+    """The inline ``fixed_frontier:8000`` spec (cohort-free arming, seeded
+    commitment) flips at the same tick as the archived B32 file policy in
+    all 30 rollouts and reproduces the same 28 switches."""
+    policy_path, rollouts, switches, _ = _load_golden(
+        "b32_cap16384_fixed_frontier8000_30step"
+    )
+    file_switcher = _switcher(policy_path)
+    file_history = lockstep_replay(file_switcher, rollouts)
+    inline = _switcher("fixed_frontier:8000")
+    inline_history = []
+    for rollout in rollouts:
+        inline_history.extend(lockstep_replay(inline, [rollout]))
+        inline.tick(_step([], unfinished=0))  # drain between cohort-free rollouts
+
+    def first_int4(history: list[str]) -> int | None:
+        return history.index(INT4) if INT4 in history else None
+
+    assert [first_int4(h) for h in inline_history] == [
+        first_int4(h) for h in file_history
+    ]
+    assert len(inline.switches) == len(file_switcher.switches) == len(switches)
+    for mine, theirs in zip(inline.switches, file_switcher.switches, strict=True):
+        assert (mine.rollout_index, mine.applied_response_tokens) == (
+            theirs.rollout_index,
+            theirs.applied_response_tokens,
+        )
+        assert {e.request_id for e in mine.cohort} == {
+            e.request_id for e in theirs.cohort
+        }

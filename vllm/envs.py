@@ -293,6 +293,7 @@ if TYPE_CHECKING:
     VLLM_DUAL_PRECISION_POLICY: str = ""
     VLLM_DUAL_PRECISION_ONLINE_OBSERVATIONS: str = ""
     VLLM_DUAL_PRECISION_RELOAD_POLICY_EACH_ROLLOUT: bool = False
+    VLLM_DUAL_PRECISION_REQUIRE_POLICY_ADVANCE: bool = False
 
 
 def get_default_cache_root():
@@ -2078,11 +2079,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DUAL_PRECISION_ONLINE_OBSERVATIONS": lambda: os.getenv(
         "VLLM_DUAL_PRECISION_ONLINE_OBSERVATIONS", ""
     ),
-    # Re-read the policy JSON once at every rollout boundary and fail closed
-    # (raise) unless its calibration.policy_revision advanced. Only meaningful
-    # with a JSON policy under online calibration. Default off.
+    # Re-read the policy JSON once at every rollout boundary (online
+    # calibration). An unchanged calibration.policy_revision is logged as a
+    # lag and recorded in the switch-cohort JSONL; a revision that went
+    # backwards or an invalid file always raises. Default off.
     "VLLM_DUAL_PRECISION_RELOAD_POLICY_EACH_ROLLOUT": lambda: bool(
         int(os.getenv("VLLM_DUAL_PRECISION_RELOAD_POLICY_EACH_ROLLOUT", "0"))
+    ),
+    # Strict fallback for the reload above: fail closed (raise) when the
+    # revision did not advance at a boundary (rollout 2 onwards). The primary
+    # lag protection is the verl-side policy barrier
+    # (precision_scheduler.policy_barrier_timeout_s). Default off.
+    "VLLM_DUAL_PRECISION_REQUIRE_POLICY_ADVANCE": lambda: bool(
+        int(os.getenv("VLLM_DUAL_PRECISION_REQUIRE_POLICY_ADVANCE", "0"))
     ),
 }
 
