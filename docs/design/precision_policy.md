@@ -38,9 +38,12 @@ GPU worker (which reads `capture_max_batch`) and the CPU-only policy toolkit
 `load_precision_policy(spec)` returns a `PrecisionPolicy` for every kind, so
 C4 has one switcher and one cohort log format. `fixed_threshold` is expressed
 exactly as the full-RL matrix emulated it (`fixed_t{2,4,8}.json`: constant
-250 table plus `max_switch_live_batch`); the first frontier must be observed
-before a drain can switch, so a drain inside the first 250 response tokens
-switches at the 250 crossing.
+250 table plus `max_switch_live_batch`) plus the archived arming latch: the
+guard opens only after the actual live batch was observed above `t`
+(`PolicyDecider.peak_actual_live`), so a small live count while an
+asynchronously admitted cohort is still arriving is not mistaken for a
+drain. The first frontier must be observed before a drain can switch, so a
+drain inside the first 250 response tokens switches at the 250 crossing.
 
 ### Lookup table
 
@@ -191,11 +194,14 @@ because the update uses strict less-than while iterating upward.
 
 `PolicyStore(spec).load()` reads the policy once; `reload()` re-reads the
 file between rollouts. The installed policy is kept and `PolicyRevisionError`
-is raised when the file is unreadable or invalid or its
-`calibration.policy_revision` went backwards; with `require_advance=True` an
-unchanged revision also raises (fail closed against a stale table). A
-reload that advances the revision installs the new policy; inline specs
-reload to themselves. `reload_count` / `last_reload_advanced` let C4 log
+is raised when the file is unreadable or invalid, when its
+`calibration.policy_revision` went backwards, or (default
+`require_advance=True`, fail closed against a stale table) when the revision
+did not advance. The first `reload()` after `load()` is explicitly exempt
+from the advance requirement: the calibrator has not run at the first
+rollout boundary (the archived EMA runs log "Reloaded ... before rollout 1:
+revision=0" with an unchanged file). A reload that advances the revision
+installs the new policy; inline specs reload to themselves. `reload_count` / `last_reload_advanced` let C4 log
 "Reloaded policy before rollout N: revision=R" once per boundary.
 
 ## Policy JSON schema
@@ -244,6 +250,14 @@ block by C9. Module constants: `DEFAULT_SCAN_INTERVAL_TOKENS = 250`,
 `DEFAULT_SPEC_RESPONSE_CAP = 2^20` (frontier span of inline-spec tables),
 `UNBOUNDED_CAPTURE_MAX_BATCH = 2^30` (`uniform_w4`: no INT4 ceiling).
 
+Inline-spec derived knobs:
+
+| spec | `capture_max_batch` | `max_switch_live_batch` | note |
+|---|---|---|---|
+| `fixed_frontier:<K>` | 32 | null (guard = 32) | |
+| `fixed_threshold:<t>` | `max(32, t)` | `t` | `t > 32` lifts the INT4 capture ceiling to `t` so the drain switch is graph-captured |
+| `uniform_w4` | `2^30` | null | C3 clamps with `min(policy.capture_max_batch, max_capture_size)` |
+
 ## Contracts with neighbors
 
 - **C4 scheduler** owns cohort arming, the rollout index, the cumulative
@@ -254,7 +268,9 @@ block by C9. Module constants: `DEFAULT_SCAN_INTERVAL_TOKENS = 250`,
   only at crossings) for the monotone guard-blocked switch to fire on drain.
 - **C3 dispatcher** reads `policy.capture_max_batch` to bound INT4 graph
   capture; `switch_live_cap <= capture_max_batch` is guaranteed by the
-  loader.
+  loader. `uniform_w4` sets `capture_max_batch = 2**30` (no ceiling), so C3
+  must clamp with `min(policy.capture_max_batch, max_capture_size)`;
+  `fixed_threshold:<t>` with `t > 32` lifts the ceiling to `t`.
 - **C6 toolkit** writes schema-6 files, bumps `calibration.policy_revision`
   atomically, and can validate its vectorized builder against
   `CostModel.predict` / `plan_switch`. `PrecisionPolicy.to_json()` emits a
