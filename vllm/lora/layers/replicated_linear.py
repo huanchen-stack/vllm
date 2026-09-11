@@ -47,6 +47,10 @@ class ReplicatedLinearWithLoRA(BaseLinearLayerWithLoRA):
         return output, output_bias
 
     def apply(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        if self.base_forward_override is not None:
+            # An installed override owns the base GEMM (see
+            # BaseLinearLayerWithLoRA.set_base_forward_override).
+            return BaseLinearLayerWithLoRA.apply(self, x, bias)
         # ReplicatedLinear subclasses such as GateLinear override forward() to
         # dispatch custom kernels and/or adjust the output dtype. Apply LoRA on
         # top of the actual base-layer output instead of bypassing that path.

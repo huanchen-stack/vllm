@@ -592,6 +592,39 @@ def test_base_forward_override(dist_init, default_vllm_config, monkeypatch):
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("kind", ["replicated", "row", "column"])
+def test_base_forward_override_reaches_every_layer_class(
+    dist_init, default_vllm_config, monkeypatch, kind
+):
+    """Subclasses that override apply() (ReplicatedLinearWithLoRA calls
+    base_layer() directly) must still honour the override."""
+    monkeypatch.setenv("ROLLOUT_QLORA", "1")
+    torch.set_default_device(DEVICE)
+    dtype = torch.float16
+    lora_config = LoRAConfig(max_loras=MAX_LORAS, max_lora_rank=16, lora_dtype=dtype)
+    wrapper, base, lora, a_list, b_list = _build(kind, dtype, lora_config, f"o_{kind}")
+    x = torch.rand(8, HIDDEN, dtype=dtype) - 0.5
+    reference = _reference(base, x, a_list, b_list)
+    spy = MagicMock(wraps=lambda x_, bias: base.quant_method.apply(base, x_, bias))
+    lora.set_base_forward_override(spy)
+    out = _forward(wrapper, lora, x)
+    spy.assert_called_once()
+    rtol, atol = TOLERANCES[dtype]
+    torch.testing.assert_close(out, reference, rtol=rtol, atol=atol)
+
+
+def test_max_loras_warning(dist_init, monkeypatch, caplog):
+    monkeypatch.setenv("ROLLOUT_QLORA", "1")
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="vllm.lora.punica_wrapper.punica_gpu"):
+        _make_wrapper(
+            LoRAConfig(max_loras=2, max_lora_rank=8, lora_dtype=torch.float16)
+        )
+    assert any("max_loras=2" in r.getMessage() for r in caplog.records)
+
+
+@torch.inference_mode()
 def test_dual_stream_lora_first_and_override_precedence(
     dist_init, default_vllm_config, monkeypatch
 ):

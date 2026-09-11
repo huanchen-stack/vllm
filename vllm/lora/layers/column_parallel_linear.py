@@ -33,7 +33,7 @@ def _mcp_apply(x, bias, layer: "ColumnParallelLinearWithLoRA"):
         == len(layer.output_slices)
     )
 
-    output = layer.base_layer.quant_method.apply(layer.base_layer, x, bias)
+    output = layer._base_forward(x, bias)
 
     x = x.view(-1, x.shape[-1])
     output, out_orig_shape = output.view(-1, output.shape[-1]), output.shape

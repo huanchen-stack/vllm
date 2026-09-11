@@ -112,6 +112,14 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             envs.ROLLOUT_QLORA and not self.lora_config.fully_sharded_loras
         )
         self._rollout_fuse_packed = envs.VLLM_ROLLOUT_LORA_FUSE_PACKED
+        if envs.ROLLOUT_QLORA and self.max_loras > 1:
+            logger.warning(
+                "ROLLOUT_QLORA is set with max_loras=%d. The fast path is only "
+                "supported with max_loras=1: under torch.compile the "
+                "single-adapter decision is frozen at first compile, so batches "
+                "that would need the Punica fallback are not handled.",
+                self.max_loras,
+            )
         self._rollout_single_lora_index: int | None = None
         self._rollout_fast_path_logged = False
         self._rollout_fallback_logged = False

@@ -310,8 +310,7 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
             # The override owns the base GEMM (e.g. the dual-precision base
             # selector); LoRA is applied synchronously on the same stream and
             # the dual-stream op is deliberately not used (design decision 1).
-            output = self.base_forward_override(x, bias)
-            return self._apply_lora_to_output(x, output)
+            return self._apply_sync(x, bias)
         # is_forward_context_available for tower modules
         if self._enable_aux_cuda_stream and is_forward_context_available():
             output_size = sum(self.output_slices)
@@ -321,10 +320,18 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         else:
             return self._apply_sync(x, bias)
 
+    def _base_forward(
+        self, x: torch.Tensor, bias: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Base GEMM: the installed override if any, else quant_method.apply."""
+        if self.base_forward_override is not None:
+            return self.base_forward_override(x, bias)
+        return self.base_layer.quant_method.apply(self.base_layer, x, bias)
+
     def _apply_sync(
         self, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
-        output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
+        output = self._base_forward(x, bias)
         return self._apply_lora_to_output(x, output)
 
     def _apply_base_forward(self, x: torch.Tensor) -> torch.Tensor:
