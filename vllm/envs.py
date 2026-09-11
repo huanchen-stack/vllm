@@ -280,6 +280,9 @@ if TYPE_CHECKING:
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
+    VLLM_DUAL_PRECISION_POLICY: str = ""
+    VLLM_DUAL_PRECISION_ONLINE_OBSERVATIONS: str = ""
+    VLLM_DUAL_PRECISION_RELOAD_POLICY_EACH_ROLLOUT: bool = False
 
 
 def get_default_cache_root():
@@ -1982,6 +1985,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each entry is VAR_NAME or VAR_NAME:<suffix> (suffix appended to
     # RDMA device name). Must be set together with VLLM_GPU_NIC_PCIE_MAPPING.
     "VLLM_NIC_SELECTION_VARS": lambda: os.getenv("VLLM_NIC_SELECTION_VARS", ""),
+    # --- Rollout precision switching (vllm/v1/core/sched/precision_switch) ---
+    # Switching policy for dual-precision rollouts: an inline spec
+    # (``fixed_threshold:<t>``, ``fixed_frontier:<K>``, ``uniform_w4``) or a
+    # path to a policy JSON (see docs/design/precision_policy.md). Empty
+    # (default) disables the scheduler-side switcher entirely and leaves
+    # SchedulerOutput.dual_precision_base_precision at None.
+    "VLLM_DUAL_PRECISION_POLICY": lambda: os.getenv("VLLM_DUAL_PRECISION_POLICY", ""),
+    # Append one JSON line per rollout switch (the "switch cohort": every live
+    # request with its response length at the switch) to this path. Consumed
+    # by the online hazard-EMA calibrator. Empty (default) disables logging.
+    "VLLM_DUAL_PRECISION_ONLINE_OBSERVATIONS": lambda: os.getenv(
+        "VLLM_DUAL_PRECISION_ONLINE_OBSERVATIONS", ""
+    ),
+    # Re-read the policy JSON once at every rollout boundary and fail closed
+    # (raise) unless its calibration.policy_revision advanced. Only meaningful
+    # with a JSON policy under online calibration. Default off.
+    "VLLM_DUAL_PRECISION_RELOAD_POLICY_EACH_ROLLOUT": lambda: bool(
+        int(os.getenv("VLLM_DUAL_PRECISION_RELOAD_POLICY_EACH_ROLLOUT", "0"))
+    ),
 }
 
 

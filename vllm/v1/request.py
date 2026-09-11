@@ -131,6 +131,10 @@ class Request:
             prompt_token_ids, prompt_embeds
         )
         self._output_token_ids: list[int] = []
+        # Generated tokens folded into the prompt by resumable streaming-input
+        # continuation. They remain response progress for the rollout
+        # precision switcher even though they are now part of the context.
+        self.streaming_output_token_offset = 0
         self._all_token_ids: list[int] = (
             self.prompt_token_ids.copy()
             if self.prompt_token_ids is not None
@@ -246,6 +250,11 @@ class Request:
     @property
     def num_output_tokens(self) -> int:
         return len(self._output_token_ids)
+
+    @property
+    def num_cumulative_output_tokens(self) -> int:
+        """Generated response length across resumable streaming chunks."""
+        return self.streaming_output_token_offset + self.num_output_tokens
 
     @property
     def num_encoder_inputs(self) -> int:

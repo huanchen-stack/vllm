@@ -240,6 +240,17 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # Total number of unfinished requests known to the scheduler, including
+    # requests that are waiting or preempted and therefore absent from the
+    # current GPU forward. This is distinct from len(num_scheduled_tokens).
+    num_unfinished_requests: int | None = None
+
+    # Scheduler-owned base precision ("bf16" / "int4") for this step under a
+    # rollout precision policy, or None when no policy is configured. The
+    # decision needs response-length history and a one-way latch, so workers
+    # must not reconstruct it from the current request count.
+    dual_precision_base_precision: str | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
@@ -252,6 +263,8 @@ class SchedulerOutput:
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
+            num_unfinished_requests=0,
+            dual_precision_base_precision=None,
         )
 
 
