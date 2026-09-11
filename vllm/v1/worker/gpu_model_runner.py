@@ -170,6 +170,7 @@ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.prompt_logprob_extra import inject_extra_prompt_logprobs
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
@@ -5416,10 +5417,18 @@ class GPUModelRunner(
             tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
 
             # Compute prompt logprobs.
-            logprobs = self.sampler.compute_logprobs(logits)
+            raw_logprobs = self.sampler.compute_logprobs(logits)
             token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
-                logprobs, num_prompt_logprobs, tgt_token_ids
+                raw_logprobs, num_prompt_logprobs, tgt_token_ids
             )
+            if envs.VLLM_PROMPT_LOGPROB_EXTRA_TOKEN_IDS:
+                token_ids, logprobs = inject_extra_prompt_logprobs(
+                    token_ids,
+                    logprobs,
+                    raw_logprobs,
+                    envs.VLLM_PROMPT_LOGPROB_EXTRA_TOKEN_IDS,
+                    num_prompt_logprobs,
+                )
 
             # Transfer GPU->CPU async.
             chunk_slice = slice(start_idx, start_idx + num_logits)

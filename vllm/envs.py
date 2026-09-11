@@ -278,6 +278,7 @@ if TYPE_CHECKING:
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
+    VLLM_PROMPT_LOGPROB_EXTRA_TOKEN_IDS: list[int] = []
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
 
@@ -1972,6 +1973,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_LORA_ENABLE_DUAL_STREAM": lambda: bool(
         int(os.getenv("VLLM_LORA_ENABLE_DUAL_STREAM", "0"))
     ),
+    # Comma-separated token ids whose exact prompt logprobs replace the last
+    # len(ids) top-k columns of every prompt-logprob row (diagnostics for the
+    # EOS-hazard / layer-sensitivity studies). Requires prompt_logprobs >= len(ids).
+    # Default empty: prompt logprobs are unchanged.
+    "VLLM_PROMPT_LOGPROB_EXTRA_TOKEN_IDS": lambda: [
+        int(token_id)
+        for token_id in os.getenv("VLLM_PROMPT_LOGPROB_EXTRA_TOKEN_IDS", "").split(",")
+        if token_id.strip()
+    ],
     # If set to 1, use Python spinloop extension to poll in a more efficient
     # way when using the mp backend.
     "VLLM_USE_SPINLOOP_EXT": lambda: bool(int(os.getenv("VLLM_USE_SPINLOOP_EXT", "0"))),
