@@ -562,13 +562,14 @@ def test_reload_once_per_boundary_and_fail_closed_on_stale_revision(tmp_path):
     switcher = _switcher(path, reload_each_rollout=True)
     switcher.on_new_request("a")
     switcher.on_new_request("b")
-    assert switcher.reloads == []
+    # Before rollout 1 the file is re-read as is (the calibrator has not run).
+    assert switcher.reloads == [(1, 0)]
     # Watcher bumps the revision between cohorts (atomic replace).
     updated = dict(raw, calibration={"policy_revision": 1})
     _write_policy(tmp_path, updated)
     switcher.on_new_request("c")
     switcher.on_new_request("d")
-    assert switcher.reloads == [(2, 1)]
+    assert switcher.reloads == [(1, 0), (2, 1)]
     assert switcher.policy.policy_revision == 1
     assert switcher.rollout_index == 2
     # Empty scheduler at the boundary (rollout-only back-to-back calls) must
@@ -578,10 +579,19 @@ def test_reload_once_per_boundary_and_fail_closed_on_stale_revision(tmp_path):
     switcher.on_new_request("e")
     switcher.tick(_step([], unfinished=0))
     switcher.on_new_request("f")
-    assert switcher.reloads == [(2, 1), (3, 2)]
+    assert switcher.reloads == [(1, 0), (2, 1), (3, 2)]
     # Stale revision (watcher lag or death): fail closed at the boundary.
     with pytest.raises(PolicyRevisionError):
         switcher.on_new_request("g")
+    # A stale revision at the FIRST boundary after rollout 1 fails too: only
+    # the reload before rollout 1 is exempt.
+    stale_path = _write_policy(tmp_path, raw, "stale.json")
+    stale = _switcher(stale_path, reload_each_rollout=True)
+    stale.on_new_request("a")
+    stale.on_new_request("b")
+    assert stale.reloads == [(1, 0)]
+    with pytest.raises(PolicyRevisionError):
+        stale.on_new_request("c")
     # Inline specs never reload.
     inline = _switcher("fixed_frontier:1000", reload_each_rollout=True)
     inline.tick(_step(_live(("a", 10, 0))))

@@ -137,10 +137,13 @@ formats too.
 ### Reload at rollout boundaries
 
 With `VLLM_DUAL_PRECISION_RELOAD_POLICY_EACH_ROLLOUT=1` and a file policy,
-`start_rollout` calls `PolicyStore.reload()` exactly once per boundary
-before rollout N >= 2 and fails closed: a `PolicyRevisionError` (unreadable
-or invalid file, revision not advanced, revision went backwards) propagates
-out of `add_request`, so a stale table cannot silently drive a rollout. The
+`start_rollout` calls `PolicyStore.reload()` exactly once per boundary,
+rollout 1 included (the archived runs log `Reloaded ... before rollout 1:
+revision=0`; the store exempts that first reload from the advance check
+because the calibrator has not run yet), and fails closed from rollout 2 on:
+a `PolicyRevisionError` (unreadable or invalid file, revision not advanced,
+revision went backwards) propagates out of `add_request`, so a stale table
+cannot silently drive a rollout. The
 experimental runtime reloaded twice per boundary (`add_request` when empty
 plus the cohort boundary; 59 reloads for 29 boundaries in every Sep-8 run)
 and only logged exceptions; the B128/16K continuous-EMA run kept switching

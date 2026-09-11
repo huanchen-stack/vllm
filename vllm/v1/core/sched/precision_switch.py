@@ -228,7 +228,7 @@ class RolloutPrecisionSwitcher:
         """Build from the decision-6 spec string and the two runtime knobs
         (the scheduler passes ``envs.*`` values through; nothing here reads
         the environment)."""
-        store = PolicyStore(policy_spec, require_advance=reload_each_rollout)
+        store = PolicyStore(policy_spec)
         store.load()
         return cls(
             store,
@@ -295,13 +295,15 @@ class RolloutPrecisionSwitcher:
     # ------------------------------------------------------------- boundaries
 
     def start_rollout(self) -> None:
-        """Begin the next rollout: reload the policy once (when enabled and a
-        rollout preceded this one), reset every per-rollout state, arm."""
-        if (
-            self.rollout_index >= 1
-            and self.reload_each_rollout
-            and self.store.spec.is_file
-        ):
+        """Begin the next rollout: reload the policy once (when enabled),
+        reset every per-rollout state, arm.
+
+        The reload before rollout 1 re-reads the file just loaded (the
+        archived runs log "Reloaded ... before rollout 1: revision=0"); the
+        store exempts that first reload from the advance check, and every
+        later boundary must see a higher revision or fail closed.
+        """
+        if self.reload_each_rollout and self.store.spec.is_file:
             self._reload_policy(self.rollout_index + 1)
         self.end_rollout()
         self.rollout_index += 1
