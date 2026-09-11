@@ -115,6 +115,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         self._rollout_single_lora_index: int | None = None
         self._rollout_fast_path_logged = False
         self._rollout_fallback_logged = False
+        self._rollout_fallback_ids: list[int] = []
         # Punica kernel metadata (LoRAKernelMeta.prepare_tensors) contains a
         # device-to-host sync (torch.all -> host bool) plus sort/unique
         # kernels. On the fast path it is prepared lazily, only if a Punica
@@ -157,13 +158,21 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         self._update_base_metadata(mapping, lora_index_to_id, max_loras, vocab_size)
 
         self._punica_metadata_prepared = False
-        self._rollout_single_lora_index = (
-            select_rollout_single_lora_index(
-                mapping.index_mapping, lora_index_to_id, max_loras
+        if self._rollout_fast_path_enabled:
+            # Note: the `max_loras` argument is the manager's slot count + 1;
+            # the table keys on the configured number of slots.
+            self._rollout_single_lora_index = select_rollout_single_lora_index(
+                mapping.index_mapping, lora_index_to_id, self.max_loras
             )
-            if self._rollout_fast_path_enabled
-            else None
-        )
+            if (
+                self._rollout_single_lora_index is None
+                and not self._rollout_fallback_logged
+            ):
+                # Diagnostics for the (one-time) fallback warning, computed
+                # on the host side only while it has not been logged yet.
+                self._rollout_fallback_ids = sorted(set(mapping.index_mapping))[:8]
+        else:
+            self._rollout_single_lora_index = None
         if self._rollout_single_lora_index is None:
             # Vanilla behaviour: prepare cuda kernel metadata tensors now.
             self._prepare_punica_metadata()
@@ -203,17 +212,16 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             rollout_lora_a_stacked is not None and rollout_lora_b_stacked is not None
         )
         if lora_index is None or (self._rollout_fuse_packed and not fuse_packed):
-            if self._rollout_fast_path_enabled and not self._rollout_fallback_logged:
+            if not self._rollout_fallback_logged and not torch.compiler.is_compiling():
                 self._rollout_fallback_logged = True
                 logger.warning(
                     "Rollout QLoRA fast path fallback to Punica: "
                     "single_lora_index=%s, fuse_packed=%s, has_packed_buffers=%s, "
-                    "token_lora_ids=%s, fully_sharded=%s.",
+                    "token_lora_ids=%s.",
                     lora_index,
                     self._rollout_fuse_packed,
                     rollout_lora_a_stacked is not None,
-                    sorted(set(self.token_lora_indices.tolist()))[:8],
-                    self.lora_config.fully_sharded_loras,
+                    self._rollout_fallback_ids,
                 )
             return False
 

@@ -180,6 +180,26 @@ def test_lazy_punica_metadata(dist_init, monkeypatch, rollout_qlora):
     assert token_spy.call_count == prompt_spy.call_count == 1
 
 
+def test_profile_run_mapping_uses_fast_path(dist_init, monkeypatch):
+    """Single slot, no adapter loaded, all-zero / empty dummy mapping.
+
+    This is what profile_run and CUDA-graph capture (num_active_loras=0)
+    present; the manager passes lora_slots + 1 as max_loras, so the table
+    must key on the configured slot count and keep the torch path.
+    """
+    monkeypatch.setenv("ROLLOUT_QLORA", "1")
+    lora_config = LoRAConfig(max_loras=1, max_lora_rank=8, lora_dtype=torch.float16)
+    wrapper = _make_wrapper(lora_config)
+    token_spy, _ = _spy_prepare(wrapper)
+    for mapping in (
+        LoRAMapping([0] * 8, [0] * 2, is_prefill=True),
+        LoRAMapping([], [], is_prefill=True),
+    ):
+        wrapper.update_metadata(mapping, [None], 2, 512)
+        assert wrapper._rollout_single_lora_index == 0
+    assert token_spy.call_count == 0
+
+
 @dataclass
 class FakeConfig:
     hidden_size = HIDDEN
