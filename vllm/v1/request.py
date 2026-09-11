@@ -170,6 +170,15 @@ class Request:
         # The number of times this request has been preempted by the scheduler.
         self.num_preemptions = 0
 
+        # Re-prefill after the rollout precision switch (default-off ablation,
+        # VLLM_DUAL_PRECISION_REPREFILL): the scheduler preempts this request
+        # once at the switch so its KV is recomputed under the INT4 base. The
+        # latch makes the trigger idempotent per request; the offset records
+        # how many response tokens existed at the boundary (they survive the
+        # preemption, so the max_tokens budget is unaffected).
+        self.precision_reprefill_done = False
+        self.precision_reprefill_output_offset = 0
+
         self.prefill_stats: PrefillStats | None = PrefillStats()
 
         self.block_hashes: list[BlockHash] = []
