@@ -159,6 +159,7 @@ if TYPE_CHECKING:
     VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY: str = ""
     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
+    VLLM_MARLIN_INPUT_PADDING: bool = False
     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
@@ -278,6 +279,9 @@ if TYPE_CHECKING:
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
+    VLLM_PROMPT_LOGPROB_EXTRA_TOKEN_IDS: list[int] = []
+    ROLLOUT_QLORA: bool = False
+    VLLM_ROLLOUT_LORA_FUSE_PACKED: bool = True
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_DUAL_PRECISION_ROLLOUT: bool = False
@@ -1338,6 +1342,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MARLIN_USE_ATOMIC_ADD": lambda: (
         os.environ.get("VLLM_MARLIN_USE_ATOMIC_ADD", "0") == "1"
     ),
+    # Permit symmetric groupwise compressed-tensors WNA16 layers whose input
+    # dimension K is not a Marlin tile multiple (128) to append all-zero
+    # quantization groups with unit scales so the Marlin kernel can be used
+    # instead of the Triton fallback (e.g. Nemotron-Nano-9B-v2 down_proj,
+    # K=15680). Activations are zero-padded by the same amount at execution
+    # time, so the result is mathematically unchanged. Only TP=1 (or
+    # non-row-parallel) layers are padded. Default off.
+    "VLLM_MARLIN_INPUT_PADDING": lambda: (
+        os.environ.get("VLLM_MARLIN_INPUT_PADDING", "0") == "1"
+    ),
     # Whether to use marlin kernel in mxfp4 quantization method
     # Deprecated: use --moe-backend marlin (MoE) or --linear-backend marlin
     # (linear) instead.
@@ -1977,6 +1991,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # overlap the base layer compute with the LoRA fast path).
     "VLLM_LORA_ENABLE_DUAL_STREAM": lambda: bool(
         int(os.getenv("VLLM_LORA_ENABLE_DUAL_STREAM", "0"))
+    ),
+    # Comma-separated token ids whose exact prompt logprobs replace the last
+    # len(ids) top-k columns of every prompt-logprob row (diagnostics for the
+    # EOS-hazard / layer-sensitivity studies). Requires prompt_logprobs >= len(ids).
+    # Default empty: prompt logprobs are unchanged.
+    "VLLM_PROMPT_LOGPROB_EXTRA_TOKEN_IDS": lambda: [
+        int(token_id)
+        for token_id in os.getenv("VLLM_PROMPT_LOGPROB_EXTRA_TOKEN_IDS", "").split(",")
+        if token_id.strip()
+    ],
+    # Enable the single-adapter rollout LoRA fast path: LoRA linear layers
+    # run as two torch GEMMs (x @ A^T @ B^T) instead of the Punica
+    # shrink/expand kernels, packed slices (QKV, gate-up, Qwen3.5 in_proj)
+    # are fused into one GEMM pair, and Punica metadata preparation (which
+    # contains a device-to-host sync) is skipped unless a Punica entry point
+    # is hit. Requires exactly one active adapter per batch and
+    # fully_sharded_loras=False; mixed batches fall back to Punica.
+    "ROLLOUT_QLORA": lambda: bool(int(os.getenv("ROLLOUT_QLORA", "0"))),
+    # When the rollout fast path is active, fuse the packed slices of a
+    # merged layer into a single GEMM pair (1, default) or run one torch
+    # GEMM pair per slice (0). Only used for the kernel ablation.
+    "VLLM_ROLLOUT_LORA_FUSE_PACKED": lambda: bool(
+        int(os.getenv("VLLM_ROLLOUT_LORA_FUSE_PACKED", "1"))
     ),
     # If set to 1, use Python spinloop extension to poll in a more efficient
     # way when using the mp backend.

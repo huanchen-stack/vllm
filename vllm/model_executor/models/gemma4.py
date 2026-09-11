@@ -1713,9 +1713,33 @@ class Gemma4ForCausalLM(
             "vision_tower.",
             "embed_audio.",
             "embed_vision.",
+            # Encoder-free Gemma 4 Unified checkpoints store the raw-patch
+            # projection under this prefix. The language-model-only registry
+            # path intentionally does not construct it.
+            "vision_embedder.",
         ]
         if self.config.tie_word_embeddings:
             skip.append("lm_head.")
 
         loader = AutoWeightsLoader(self, skip_substrs=skip)
-        return loader.load_weights(_weight_iterator())
+        loaded_weights = loader.load_weights(_weight_iterator())
+
+        # YOCO KV-shared layers do not carry k_norm parameters in official
+        # Gemma 4 checkpoints because their K/V states come from an earlier
+        # decoder layer.  The module keeps an (unused) k_norm for a uniform
+        # attention implementation, so mark it initialized for the loader's
+        # strict completeness check.  Its value is never read in forward for
+        # is_kv_shared_layer (see Gemma4Attention.forward above).
+        num_kv_shared_layers = getattr(self.config, "num_kv_shared_layers", 0)
+        if num_kv_shared_layers > 0:
+            first_kv_shared_layer_idx = (
+                self.config.num_hidden_layers - num_kv_shared_layers
+            )
+            loaded_weights.update(
+                f"model.layers.{idx}.self_attn.k_norm.weight"
+                for idx in range(
+                    first_kv_shared_layer_idx, self.config.num_hidden_layers
+                )
+            )
+
+        return loaded_weights

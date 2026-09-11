@@ -33,7 +33,7 @@ def _mcp_apply(x, bias, layer: "ColumnParallelLinearWithLoRA"):
         == len(layer.output_slices)
     )
 
-    output = layer.base_layer.quant_method.apply(layer.base_layer, x, bias)
+    output = layer._base_forward(x, bias)
 
     x = x.view(-1, x.shape[-1])
     output, out_orig_shape = output.view(-1, output.shape[-1]), output.shape
@@ -242,6 +242,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             )
             for output_size in self.output_slices
         )
+        self._create_rollout_lora_weights(max_loras)
 
     def slice_lora_a(
         self, lora_a: list[torch.Tensor | None]
@@ -324,8 +325,17 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
                 self.lora_b_stacked[i][
                     index, 0, : lora_b_i.shape[0], : lora_b_i.shape[1]
                 ].copy_(lora_b_i, non_blocking=True)
+        self._refresh_rollout_lora_weights(index)
 
     def apply(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        # The rollout fast path and the base-forward override both live in
+        # BaseLinearLayerWithLoRA.apply -> add_lora_linear; neither needs the
+        # all-gather in _mcp_apply, which only matters for fully sharded LoRA.
+        if not self.lora_config.fully_sharded_loras and (
+            self._rollout_lora_enabled or self.base_forward_override is not None
+        ):
+            return BaseLinearLayerWithLoRA.apply(self, x, bias)
+
         merged_cls = maybe_get_oot_by_class(MergedColumnParallelLinear)
         # Effectively unsharded subclasses can safely reuse their custom
         # forward() implementation before applying the LoRA delta.

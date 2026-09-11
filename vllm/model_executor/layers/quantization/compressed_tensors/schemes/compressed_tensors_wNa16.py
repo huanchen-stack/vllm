@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from functools import partial
 
 import torch
+import torch.nn.functional as F
 from compressed_tensors.quantization import ActivationOrdering
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
     MarlinLinearKernel,
@@ -35,6 +38,8 @@ __all__ = ["CompressedTensorsWNA16"]
 WNA16_SUPPORTED_TYPES_MAP = {4: scalar_types.uint4b8, 8: scalar_types.uint8b128}
 WNA16_ZP_SUPPORTED_TYPES_MAP = {4: scalar_types.uint4, 8: scalar_types.uint8}
 WNA16_SUPPORTED_BITS = list(WNA16_SUPPORTED_TYPES_MAP.keys())
+# Marlin requires the input dimension K to be a multiple of its tile size.
+MARLIN_INPUT_TILE = 128
 
 
 class CompressedTensorsWNA16(CompressedTensorsScheme):
@@ -55,6 +60,9 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         self.group_size = -1 if group_size is None else group_size
         self.has_g_idx = actorder == ActivationOrdering.GROUP
         self.layer_name = layer_name
+        # Number of zero input columns appended so K is a Marlin tile multiple
+        # (VLLM_MARLIN_INPUT_PADDING); 0 means the layer is untouched.
+        self.input_padding = 0
 
         if self.group_size == -1 and self.strategy != "channel":
             raise ValueError(
@@ -93,6 +101,20 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
     ):
         output_size_per_partition = sum(output_partition_sizes)
 
+        original_input_size = input_size_per_partition
+        input_padding = self._marlin_input_padding(input_size, input_size_per_partition)
+        if input_padding:
+            input_size += input_padding
+            input_size_per_partition += input_padding
+            logger.info_once(
+                "VLLM_MARLIN_INPUT_PADDING: padding WNA16 layer %s input K "
+                "from %d to %d (one all-zero group per %d columns).",
+                self.layer_name,
+                original_input_size,
+                input_size_per_partition,
+                self.group_size,
+            )
+
         mp_linear_kernel_config = MPLinearLayerConfig(
             full_weight_shape=(input_size, output_size),
             partition_weight_shape=(
@@ -130,10 +152,25 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
             assert input_size_per_partition % group_size == 0
             scales_and_zp_size = input_size_per_partition // group_size
 
+        def _padded_loader(kind: str) -> Callable:
+            # One wrapper per parameter so padding is keyed on parameter identity,
+            # never on tensor shape heuristics.
+            if not input_padding:
+                return weight_loader
+            return partial(
+                self._load_with_input_padding,
+                weight_loader=weight_loader,
+                kind=kind,
+                original_input_size=original_input_size,
+                padded_input_size=input_size_per_partition,
+                pack_factor=self.pack_factor,
+                group_size=group_size,
+            )
+
         weight = PackedvLLMParameter(
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
+            weight_loader=_padded_loader("weight_packed"),
             packed_factor=self.pack_factor,
             packed_dim=1,
             data=torch.empty(
@@ -144,7 +181,7 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         )
 
         weight_scale_args = {
-            "weight_loader": weight_loader,
+            "weight_loader": _padded_loader("weight_scale"),
             "data": torch.empty(
                 output_size_per_partition,
                 scales_and_zp_size,
@@ -187,7 +224,8 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         # A 2D array defining the original shape of the weights
         # before packing
         weight_shape = BasevLLMParameter(
-            data=torch.empty(2, dtype=torch.int64), weight_loader=weight_loader
+            data=torch.empty(2, dtype=torch.int64),
+            weight_loader=_padded_loader("weight_shape"),
         )
 
         layer.register_parameter("weight_packed", weight)
@@ -216,6 +254,87 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
             w_zp_param_name="weight_zero_point",
             w_gidx_param_name="weight_g_idx",
         )
+        self.input_padding = input_padding
+
+    def _marlin_input_padding(
+        self, input_size: int, input_size_per_partition: int
+    ) -> int:
+        """Zero input columns to append so K becomes a Marlin tile multiple.
+
+        Only symmetric, groupwise, non-actorder layers whose full K equals the
+        partition K are eligible: with tensor parallelism a row-parallel layer
+        shards K, and padding only the last shard would misalign the scales
+        across ranks, so such layers fall through to the regular kernel choice
+        (Triton W4A16 when K % 128 != 0).  Column-parallel layers keep the full
+        K on every rank and are padded normally.
+        """
+        if not envs.VLLM_MARLIN_INPUT_PADDING:
+            return 0
+        if not self.symmetric or self.has_g_idx or self.group_size <= 0:
+            return 0
+        if input_size != input_size_per_partition:
+            return 0
+        remainder = input_size_per_partition % MARLIN_INPUT_TILE
+        if remainder == 0:
+            return 0
+        padding = MARLIN_INPUT_TILE - remainder
+        if padding % self.group_size != 0:
+            raise ValueError(
+                "VLLM_MARLIN_INPUT_PADDING must append complete quantization "
+                f"groups, got padding={padding} for K={input_size_per_partition} "
+                f"with group_size={self.group_size} (layer {self.layer_name})."
+            )
+        return padding
+
+    @staticmethod
+    def _load_with_input_padding(
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        *args,
+        weight_loader: Callable,
+        kind: str,
+        original_input_size: int,
+        padded_input_size: int,
+        pack_factor: int,
+        group_size: int,
+        **kwargs,
+    ) -> None:
+        """Pad one checkpoint tensor along its (compressed) input dimension.
+
+        ``kind`` names the parameter this loader was attached to: the packed
+        int32 weight gets ``padding // pack_factor`` zero columns (packed zeros
+        decode to zero), the group scales get ``padding // group_size`` columns
+        of 1.0 (a unit scale for the all-zero group avoids NaN/inf), and the
+        two-element ``weight_shape`` gets its K entry rewritten.
+        """
+        padding = padded_input_size - original_input_size
+        if kind == "weight_shape":
+            loaded_weight = loaded_weight.clone()
+            if int(loaded_weight[1]) == padded_input_size:
+                pass  # already padded (e.g. re-loaded weights)
+            elif int(loaded_weight[1]) == original_input_size:
+                loaded_weight[1] = padded_input_size
+            else:
+                raise ValueError(
+                    "VLLM_MARLIN_INPUT_PADDING: weight_shape K "
+                    f"{int(loaded_weight[1])} does not match the layer's "
+                    f"input size {original_input_size}."
+                )
+        else:
+            if kind == "weight_packed":
+                pad, fill = padding // pack_factor, 0
+            elif kind == "weight_scale":
+                pad, fill = padding // group_size, 1.0
+            else:
+                raise ValueError(f"unexpected padded parameter kind {kind!r}")
+            if loaded_weight.shape[-1] + pad == param.shape[-1]:
+                loaded_weight = F.pad(loaded_weight, (0, pad), value=fill)
+            elif loaded_weight.shape[-1] != param.shape[-1]:
+                raise ValueError(
+                    f"VLLM_MARLIN_INPUT_PADDING: cannot pad {kind} from "
+                    f"{tuple(loaded_weight.shape)} to {tuple(param.shape)}."
+                )
+        weight_loader(param, loaded_weight, *args, **kwargs)
 
     # Checkpoints are serialized in compressed-tensors format, which is
     # different from the format the kernel may want. Handle repacking here.
@@ -225,4 +344,6 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
     def apply_weights(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
+        if self.input_padding:
+            x = F.pad(x, (0, self.input_padding))
         return self.kernel.apply_weights(layer, x, bias)
