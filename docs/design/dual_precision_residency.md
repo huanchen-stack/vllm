@@ -44,7 +44,7 @@ this component only makes both bases available and switchable.
    (`weight_global_scale`, `weight_scale_2` -- NVFP4 packs into the plain
    `weight` name, which BF16 has too) are matched by module name onto the
    BF16 model's LoRA wrappers (the wrapper sits at the linear's original
-   name). `VLLM_DUAL_PRECISION_BF16_LAYERS` (default `first:3,last:3`) keeps
+   name). `VLLM_DUAL_PRECISION_BF16_LAYERS` (default `none`, every block INT4) can keep
    whole transformer blocks BF16; `VLLM_DUAL_PRECISION_INT4_MODULES`
    (`all` | `mlp_only`) restricts to gate/up/down projections. Counts in the
    log line follow the archived semantics over every BF16 `LinearBase`:
@@ -122,7 +122,7 @@ this component only makes both bases available and switchable.
 |---|---|---|
 | `VLLM_DUAL_PRECISION_ROLLOUT` | `0` | enable residency (`dual_precision_rollout_enabled()`) |
 | `VLLM_DUAL_PRECISION_INT4_MODEL` | `""` | shadow checkpoint (GPTQ INT4 or ModelOpt NVFP4); required when enabled |
-| `VLLM_DUAL_PRECISION_BF16_LAYERS` | `first:3,last:3` | blocks kept BF16 (`none`, `first:N`, `last:N`, `i`, `a-b`); every final run used `none` |
+| `VLLM_DUAL_PRECISION_BF16_LAYERS` | `none` | blocks kept BF16 (`none`, `first:N`, `last:N`, `i`, `a-b`); the default was `first:3,last:3` until 2026-09-15, every final run used `none` |
 | `VLLM_DUAL_PRECISION_INT4_MODULES` | `all` | `all` or `mlp_only` (Gemma4 E2B/E4B QAT runs) |
 | `VLLM_DUAL_PRECISION_VALIDATE_SHADOW` | `0` | numerical check at load |
 | `VLLM_DUAL_PRECISION_VALIDATE_LIFECYCLE` | `0` | probes at load, re-check at first INT4 bind and after every sleep/wake-up/weight-load event |
@@ -196,7 +196,7 @@ the engine default; `resolve_sleep_level` in that module applies it at both
   which no longer holds for every shadow; the counts are unchanged) (identical to the 697 archived runs under
   `/data/huanchen/verl/.codex-report/**`); shadow store 3.32 GiB; worst
   per-layer cosine 0.9856 (`layers.30.linear_attn.in_proj_ba`, rel-RMSE
-  0.169). With the default `first:3,last:3`: 123 attached / 29 by policy
+  0.169). With `first:3,last:3` (the pre-2026-09-15 default): 123 attached / 29 by policy
   (archived line matches). Lifecycle probes after `sleep(1)`, `wake_up` and a
   weight-sync repack: six probes `exact=True, max_abs=0`.
 * Nemotron-Nano-9B-v2 + RedHatAI w4a16: 139 linears, 112 attached / 27

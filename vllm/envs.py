@@ -286,7 +286,7 @@ if TYPE_CHECKING:
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_DUAL_PRECISION_ROLLOUT: bool = False
     VLLM_DUAL_PRECISION_INT4_MODEL: str = ""
-    VLLM_DUAL_PRECISION_BF16_LAYERS: str = "first:3,last:3"
+    VLLM_DUAL_PRECISION_BF16_LAYERS: str = "none"
     VLLM_DUAL_PRECISION_INT4_MODULES: str = "all"
     VLLM_DUAL_PRECISION_VALIDATE_SHADOW: bool = False
     VLLM_DUAL_PRECISION_VALIDATE_LIFECYCLE: bool = False
@@ -2048,7 +2048,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is selected. Supports ``first:N``, ``last:N``, indices, ``a-b`` ranges
     # (comma-separated) and ``none``.
     "VLLM_DUAL_PRECISION_BF16_LAYERS": lambda: os.getenv(
-        "VLLM_DUAL_PRECISION_BF16_LAYERS", "first:3,last:3"
+        "VLLM_DUAL_PRECISION_BF16_LAYERS", "none"
     ),
     # Quantized linear families eligible for the INT4 shadow path: ``all`` or
     # ``mlp_only`` (gate/up/gate_up/down projections only; attention and
