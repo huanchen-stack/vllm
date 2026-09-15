@@ -118,7 +118,7 @@ class SynchronizedPrefillScheduler(Scheduler):
                     "reason": "synchronized batch exceeds resident KV-cache capacity",
                     "batch_size": len(active),
                     "prompt_tokens": sum(r.num_prompt_tokens for r in active),
-                    "kv_cache_usage": self.kv_cache_manager.usage(),
+                    "kv_cache_usage": self.kv_cache_manager.usage,
                     "timestamp": time.monotonic(),
                 }
             )
