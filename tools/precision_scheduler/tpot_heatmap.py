@@ -739,14 +739,21 @@ def run_precision_row(args: argparse.Namespace, precision: str) -> int:
             },
         )
         try:
+            # The estimate counts prompt + decode tokens only; the scheduler also
+            # holds blocks for the sampled tail and per-request padding, so a cell
+            # estimated at >= ~85 % of the cache has left one request waiting forever
+            # under the synchronized-prefill barrier (batch 64 x 8192 and batch 32 x
+            # 16384 on Qwen3.5-9B at gmem 0.5: 1024 of 1200 blocks). Refuse above
+            # --kv-capacity-fraction instead of hanging.
+            usable_blocks = int(kv_config.num_blocks * args.kv_capacity_fraction)
             if any(
-                required > kv_config.num_blocks
-                for required in cell.required_blocks_by_group
+                required > usable_blocks for required in cell.required_blocks_by_group
             ):
                 raise KVCapacityError(
                     "Cell requires blocks per cache group "
                     f"{cell.required_blocks_by_group}, but only "
-                    f"{kv_config.num_blocks} blocks are available per group"
+                    f"{usable_blocks} of {kv_config.num_blocks} blocks are usable "
+                    f"(--kv-capacity-fraction {args.kv_capacity_fraction})"
                 )
             row = measure_cell(
                 llm,
@@ -848,6 +855,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--initial-precision-warmup-steps", type=int, default=9)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--max-num-seqs", type=int)
+    parser.add_argument(
+        "--kv-capacity-fraction",
+        type=float,
+        default=0.8,
+        help="Skip (record as capacity_failure) any cell whose estimated resident KV "
+        "exceeds this fraction of the allocated blocks; the harness hangs on cells "
+        "that fit the estimate but not the real allocation (default 0.8).",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
     parser.add_argument("--max-model-len", type=int)
     parser.add_argument("--enforce-eager", action="store_true")
