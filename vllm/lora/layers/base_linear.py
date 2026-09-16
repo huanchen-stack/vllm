@@ -306,11 +306,9 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         self._refresh_rollout_lora_weights(index)
 
     def apply(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
-        if self.base_forward_override is not None:
-            # The override owns the base GEMM (e.g. the dual-precision base
-            # selector); LoRA is applied synchronously on the same stream and
-            # the dual-stream op is deliberately not used (design decision 1).
-            return self._apply_sync(x, bias)
+        # An installed base_forward_override (the dual-precision base selector)
+        # composes with the dual stream: the async op runs the base GEMM through
+        # _base_forward on the current stream and LoRA on the aux stream.
         # is_forward_context_available for tower modules
         if self._enable_aux_cuda_stream and is_forward_context_available():
             output_size = sum(self.output_slices)
@@ -416,7 +414,10 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         output_size = sum(self.output_slices)
 
         def base_fn() -> torch.Tensor:
-            return self.base_layer.quant_method.apply(self.base_layer, x, bias)
+            # Through _base_forward so the dual-precision override (if any)
+            # selects the BF16/INT4 base; both custom ops run eagerly inside
+            # the piecewise graph and the fork/join events are captured.
+            return self._base_forward(x, bias)
 
         def lora_fn() -> torch.Tensor:
             # Must be zeros, not empty: _lora_expand_kernel exits early (without

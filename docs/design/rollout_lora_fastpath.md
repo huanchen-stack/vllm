@@ -102,15 +102,19 @@ the two small LoRA GEMMs are queued before the large base GEMM starts.
 
 `BaseLinearLayerWithLoRA.base_forward_override` /
 `set_base_forward_override(fn)` is the hook for the dual-precision component
-(C2): when installed, `apply()` computes the base output as `fn(x, bias)` and
-applies LoRA synchronously on the same stream. Every LoRA linear class honours
-it, including `ReplicatedLinearWithLoRA` (which otherwise calls the base
-layer's own `forward`) and the sharded variants (through `_base_forward`). **Design decision 1 (accepted
-2026-09-11):** with an override installed the dual-stream op is not used. That
-is how every archived dual-precision run behaved (the dual-precision branch
-preceded the dual-stream branch in `apply()`), and the dual-stream gain below
-was only ever measured with dual precision off. Making them compose is a
-follow-up that needs re-measurement. `MergedColumnParallelLinearWithLoRA`
+(C2): when installed, the base GEMM is computed as `fn(x, bias)` wherever the
+layer would otherwise call `quant_method.apply` (`_base_forward`). Every LoRA
+linear class honours it, including `ReplicatedLinearWithLoRA` (which otherwise
+calls the base layer's own `forward`) and the sharded variants. **Design
+decision 1 (accepted 2026-09-11) was superseded on 2026-09-16:** the override
+now composes with the dual stream. `apply()` takes the `lora_linear_async` op
+whenever `VLLM_LORA_ENABLE_DUAL_STREAM=1`, and `base_fn` inside it runs through
+`_base_forward`, so the dual-precision base op executes on the current stream
+while LoRA runs on the aux stream. Until then every dual-precision run applied
+LoRA synchronously (the override branch preceded the dual-stream branch), i.e.
+`lora_dual_stream=true` had no effect in any W4 arm; the dual-stream gain below
+was measured with dual precision off.
+`MergedColumnParallelLinearWithLoRA`
 routes through the base `apply()` whenever the fast path or an override is
 active (the vanilla `_mcp_apply` all-gather path is only needed for fully
 sharded LoRA).

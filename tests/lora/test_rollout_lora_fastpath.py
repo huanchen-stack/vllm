@@ -659,12 +659,15 @@ def test_dual_stream_lora_first_and_override_precedence(
     assert exec_spy.call_args.kwargs["lora_first"] is True
     torch.testing.assert_close(out, reference, rtol=rtol, atol=atol)
 
-    # With an override installed the dual-stream op is bypassed entirely.
+    # With an override installed the dual-stream op still runs, and the base
+    # GEMM inside it goes through the override (the dual-precision selector).
     async_spy.reset_mock()
-    lora.set_base_forward_override(
-        lambda x_, bias: base.quant_method.apply(base, x_, bias)
+    override_spy = MagicMock(
+        wraps=lambda x_, bias: base.quant_method.apply(base, x_, bias)
     )
+    lora.set_base_forward_override(override_spy)
     with set_forward_context(None, default_vllm_config):
         out = _forward(wrapper, lora, x)
-    async_spy.assert_not_called()
+    async_spy.assert_called_once()
+    override_spy.assert_called_once()
     torch.testing.assert_close(out, reference, rtol=rtol, atol=atol)

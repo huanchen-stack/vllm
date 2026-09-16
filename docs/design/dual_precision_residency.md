@@ -139,8 +139,9 @@ the engine default; `resolve_sleep_level` in that module applies it at both
 
 * **C1 (`base_linear.py`)**: `BaseLinearLayerWithLoRA.base_forward_override`
   / `set_base_forward_override(fn)`; when set, `apply()` computes the base
-  output through `fn(x, bias)` and applies LoRA synchronously afterwards
-  (the dual-stream op is not used, decision 1). All dual-precision state
+  output through `fn(x, bias)`; with `VLLM_LORA_ENABLE_DUAL_STREAM=1` that
+  happens inside the `lora_linear_async` op with LoRA on the aux stream
+  (decision 1 superseded 2026-09-16). All dual-precision state
   lives in this package, keyed by module.
 * **C3/C4**: consume `BASE_PRECISION_BF16/INT4`, `bind_dual_precision(model,
   precision, no_compile_layers)` (call before every capture, replay and eager
