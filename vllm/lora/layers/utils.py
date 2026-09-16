@@ -20,7 +20,9 @@ def _get_lora_aux_cuda_stream() -> torch.cuda.Stream | None:
         return None
     global _lora_aux_cuda_stream
     if _lora_aux_cuda_stream is None and current_platform.is_cuda_alike():
-        _lora_aux_cuda_stream = torch.cuda.Stream()
+        _lora_aux_cuda_stream = torch.cuda.Stream(
+            priority=envs.VLLM_LORA_AUX_STREAM_PRIORITY
+        )
     return _lora_aux_cuda_stream
 
 

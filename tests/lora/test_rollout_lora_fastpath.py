@@ -385,6 +385,12 @@ MODES = {
     "punica": {"ROLLOUT_QLORA": "0"},
     "torch": {"ROLLOUT_QLORA": "1", "VLLM_ROLLOUT_LORA_FUSE_PACKED": "0"},
     "torch-fused": {"ROLLOUT_QLORA": "1", "VLLM_ROLLOUT_LORA_FUSE_PACKED": "1"},
+    # ablation stage: packed slices through Punica's own kernels (rank n*R, one slice)
+    "punica-packed": {
+        "ROLLOUT_QLORA": "1",
+        "VLLM_ROLLOUT_LORA_FUSE_PACKED": "1",
+        "VLLM_ROLLOUT_LORA_PACKED_KERNEL": "punica",
+    },
 }
 
 
@@ -399,6 +405,7 @@ def test_fastpath_matches_punica_reference(
     num_tokens = 48
     results = {}
     for mode, env in MODES.items():
+        monkeypatch.setenv("VLLM_ROLLOUT_LORA_PACKED_KERNEL", "torch")
         for key, value in env.items():
             monkeypatch.setenv(key, value)
         wrapper, base, lora, a_list, b_list = _build(

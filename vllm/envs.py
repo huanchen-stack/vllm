@@ -282,6 +282,9 @@ if TYPE_CHECKING:
     VLLM_PROMPT_LOGPROB_EXTRA_TOKEN_IDS: list[int] = []
     ROLLOUT_QLORA: bool = False
     VLLM_ROLLOUT_LORA_FUSE_PACKED: bool = True
+    VLLM_ROLLOUT_LORA_PACKED_KERNEL: str = "torch"
+    VLLM_LORA_DUAL_STREAM_ORDER: str = "lora_first"
+    VLLM_LORA_AUX_STREAM_PRIORITY: int = 0
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_DUAL_PRECISION_ROLLOUT: bool = False
@@ -2019,6 +2022,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # GEMM pair per slice (0). Only used for the kernel ablation.
     "VLLM_ROLLOUT_LORA_FUSE_PACKED": lambda: bool(
         int(os.getenv("VLLM_ROLLOUT_LORA_FUSE_PACKED", "1"))
+    ),
+    # Kernel that consumes the packed (fused) slices: "torch" (cuBLAS GEMM pair,
+    # single adapter, no Punica metadata) or "punica" (Punica's own shrink /
+    # expand on the packed weights as one slice of rank n*R, with the vanilla
+    # per-step metadata and sync). "punica" exists only for the kernel
+    # ablation: it isolates slice packing from the kernel swap.
+    "VLLM_ROLLOUT_LORA_PACKED_KERNEL": lambda: os.getenv(
+        "VLLM_ROLLOUT_LORA_PACKED_KERNEL", "torch"
+    ),
+    # Placement of the base GEMM and the LoRA GEMMs on the two streams when
+    # VLLM_LORA_ENABLE_DUAL_STREAM=1 and the rollout fast path is on:
+    #   lora_first: LoRA on the aux stream, queued before the base GEMM on the
+    #               current stream (default)
+    #   base_first: vanilla order (base GEMM first, LoRA on the aux stream)
+    #   base_aux:   base GEMM on the aux stream, LoRA on the current stream
+    "VLLM_LORA_DUAL_STREAM_ORDER": lambda: os.getenv(
+        "VLLM_LORA_DUAL_STREAM_ORDER", "lora_first"
+    ),
+    # CUDA stream priority of the LoRA aux stream (0 = default; negative =
+    # higher priority, e.g. -1). Ablation knob.
+    "VLLM_LORA_AUX_STREAM_PRIORITY": lambda: int(
+        os.getenv("VLLM_LORA_AUX_STREAM_PRIORITY", "0")
     ),
     # If set to 1, use Python spinloop extension to poll in a more efficient
     # way when using the mp backend.

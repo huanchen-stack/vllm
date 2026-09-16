@@ -383,15 +383,33 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         the order used by the rollout fast path.
         """
         if lora_first:
-            output, aux_results = execute_in_parallel(
-                base_fn,
-                [lora_fn],
-                self._events[0],
-                [self._events[1]],
-                [self._lora_stream],
-                enable=True,
-            )
-            return output, aux_results[0]
+            order = envs.VLLM_LORA_DUAL_STREAM_ORDER
+            if order == "base_aux":
+                # Base GEMM on the aux stream, LoRA on the current stream.
+                lora_result, aux_results = execute_in_parallel(
+                    lora_fn,
+                    [base_fn],
+                    self._events[0],
+                    [self._events[1]],
+                    [self._lora_stream],
+                    enable=True,
+                )
+                return aux_results[0], lora_result
+            if order == "lora_first":
+                output, aux_results = execute_in_parallel(
+                    base_fn,
+                    [lora_fn],
+                    self._events[0],
+                    [self._events[1]],
+                    [self._lora_stream],
+                    enable=True,
+                )
+                return output, aux_results[0]
+            if order != "base_first":
+                raise ValueError(
+                    "VLLM_LORA_DUAL_STREAM_ORDER must be lora_first, base_first "
+                    f"or base_aux, got {order!r}"
+                )
         return maybe_execute_in_parallel(
             base_fn,
             lora_fn,

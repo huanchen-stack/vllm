@@ -112,6 +112,12 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             envs.ROLLOUT_QLORA and not self.lora_config.fully_sharded_loras
         )
         self._rollout_fuse_packed = envs.VLLM_ROLLOUT_LORA_FUSE_PACKED
+        self._rollout_packed_kernel = envs.VLLM_ROLLOUT_LORA_PACKED_KERNEL
+        if self._rollout_packed_kernel not in ("torch", "punica"):
+            raise ValueError(
+                "VLLM_ROLLOUT_LORA_PACKED_KERNEL must be 'torch' or 'punica', "
+                f"got {self._rollout_packed_kernel!r}"
+            )
         if envs.ROLLOUT_QLORA and self.max_loras > 1:
             logger.warning(
                 "ROLLOUT_QLORA is set with max_loras=%d. The fast path is only "
@@ -194,8 +200,13 @@ class PunicaWrapperGPU(PunicaWrapperBase):
                 )
         else:
             self._rollout_single_lora_index = None
-        if self._rollout_single_lora_index is None:
-            # Vanilla behaviour: prepare cuda kernel metadata tensors now.
+        if (
+            self._rollout_single_lora_index is None
+            or self._rollout_packed_kernel == "punica"
+        ):
+            # Vanilla behaviour: prepare cuda kernel metadata tensors now
+            # (the packed-Punica ablation stage keeps the vanilla metadata
+            # path, including its per-step device-to-host sync).
             self._prepare_punica_metadata()
 
     def _prepare_punica_metadata(self) -> None:
@@ -240,6 +251,25 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         x = x.view(-1, x.shape[-1])
         y = y.view(-1, y.shape[-1])
         assert y.shape[-1] == sum(output_slices)
+
+        if fuse_packed and self._rollout_packed_kernel == "punica":
+            # Ablation stage "packed via Punica": the packed weights as one
+            # slice of rank n*R through the vanilla shrink/expand kernels.
+            assert rollout_lora_a_stacked is not None
+            assert rollout_lora_b_stacked is not None
+            packed_rank = rollout_lora_b_stacked.size(-1)
+            buffer = torch.empty(
+                (1, x.size(0), packed_rank), dtype=torch.float32, device=x.device
+            )
+            self.add_shrink(buffer, x, (rollout_lora_a_stacked,), scale)
+            self.add_expand(
+                y,
+                buffer,
+                (rollout_lora_b_stacked,),
+                (y.shape[-1],),
+                add_inputs=add_inputs,
+            )
+            return True
 
         if fuse_packed:
             assert rollout_lora_a_stacked is not None
