@@ -113,7 +113,11 @@ whenever `VLLM_LORA_ENABLE_DUAL_STREAM=1`, and `base_fn` inside it runs through
 while LoRA runs on the aux stream. Until then every dual-precision run applied
 LoRA synchronously (the override branch preceded the dual-stream branch), i.e.
 `lora_dual_stream=true` had no effect in any W4 arm; the dual-stream gain below
-was measured with dual precision off.
+was measured with dual precision off. **Naming (2026-09-17):** "ours" means the fast path *with* the
+dual stream composed, i.e. `ROLLOUT_QLORA=1 VLLM_ROLLOUT_LORA_FUSE_PACKED=1 VLLM_LORA_ENABLE_DUAL_STREAM=1`
+on commit `7a729da156` or later. Dual-precision runs recorded before that commit executed LoRA on the
+synchronous path regardless of the env; they are labelled "legacy sync LoRA" in the run reports and are
+not pooled with current-engine runs.
 `MergedColumnParallelLinearWithLoRA`
 routes through the base `apply()` whenever the fast path or an override is
 active (the vanilla `_mcp_apply` all-gather path is only needed for fully
