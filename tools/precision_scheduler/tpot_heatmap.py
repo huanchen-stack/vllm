@@ -643,6 +643,12 @@ def run_precision_row(args: argparse.Namespace, precision: str) -> int:
         llm_kwargs["language_model_only"] = True
     if args.adapter:
         llm_kwargs.update(enable_lora=True, max_lora_rank=args.max_lora_rank)
+        if args.lora_target_modules:
+            # Match what verl's overlays pass. Left unset, vLLM LoRA-wraps every
+            # module it supports, including the embedding, whose vanilla punica path
+            # has a data-dependent branch that torch.compile cannot trace; the
+            # rollout fast path only covers the linears.
+            llm_kwargs["lora_target_modules"] = args.lora_target_modules
     if args.full_cudagraph_without_torch_compile:
         if args.enforce_eager:
             raise ValueError(
@@ -808,6 +814,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="zero-delta LoRA adapter (tools/rollout_lora/make_zero_lora.py)",
     )
     parser.add_argument("--max-lora-rank", type=int, default=16)
+    parser.add_argument(
+        "--lora-target-modules",
+        type=lambda v: [m.strip() for m in v.split(",") if m.strip()],
+        help=(
+            "comma-separated LoRA target modules, as the verl overlay passes them "
+            "(e.g. qkv_proj,o_proj,gate_up_proj,down_proj); unset wraps every "
+            "supported module, embedding included"
+        ),
+    )
     parser.add_argument(
         "--batch-sizes", required=True, help="e.g. 1,2,4,8,16,32 or 1:32:1"
     )
