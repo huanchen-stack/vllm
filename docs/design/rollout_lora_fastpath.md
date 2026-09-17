@@ -82,12 +82,24 @@ captured graph contains the same kernels. The flip side is that a batch with
 rollout, and it is why the path is opt-in.
 
 `add_lora_linear` then dispatches to `_add_lora_linear_rollout` (fused or
-per-slice), casting the op output to the activation dtype. Any Punica entry
-point (`add_shrink`, `add_expand`, `add_lora_embedding`, the Punica branch of
-`add_lora_linear`, `add_lora_logits`, `moe_lora_align_block_size`,
+per-slice), casting the op output to the activation dtype. `add_lora_embedding`
+and `add_lora_logits` have single-adapter torch branches of the same shape
+(`_add_lora_embedding_rollout`, `_add_lora_logits_rollout`): the embedding
+layer has already applied LoRA-A with a plain `F.embedding` lookup, so only
+`y += x @ B.T` for the active slot remains, and the LM head is one
+`rollout_lora_matmul`. Any remaining Punica entry point (`add_shrink`,
+`add_expand`, the Punica branches of the three above, `moe_lora_align_block_size`,
 `add_lora_fused_moe`) first calls `_ensure_punica_metadata_prepared`, so the
-metadata sync is paid lazily and only when an adapter targets `lm_head` /
-`embed_tokens` / MoE experts or a batch carries several adapters. One warning
+metadata sync is paid lazily and only when an adapter targets MoE experts or a
+batch carries several adapters.
+
+The embedding and LM-head branches exist because of fullgraph capture. Under
+torch.compile the lazy preparation cannot run inside the forward: its
+`no_lora` early exit reads a device tensor as a Python bool, which is
+data-dependent control flow, and vLLM compiles with fullgraph capture, so the
+first vanilla-Punica op to request the metadata inside the forward aborted
+engine start. Before these branches that was any adapter, or any unrestricted
+`lora_target_modules`, that wrapped the embedding. One warning
 line is logged when the fast path first fires
 (`Rollout QLoRA torch path active: fused_packed=..., lora_index=..., tokens=...`)
 and one when it first falls back, with the token-id set that caused it.
@@ -135,8 +147,8 @@ Both new knobs are read once at layer / wrapper construction; nothing on the
 forward path touches `os.environ`.
 
 **Preconditions / supported configuration.** `max_loras=1`,
-`fully_sharded_loras=False`, TP=1, and linear-only LoRA target modules (no
-`lm_head` / `embed_tokens` / MoE experts). Under torch.compile (vLLM's
+`fully_sharded_loras=False`, TP=1, and LoRA target modules limited to linears,
+`embed_tokens` and `lm_head` (no MoE experts). Under torch.compile (vLLM's
 default fullgraph capture, guards dropped) the fast-path decision taken in
 `_add_lora_linear_rollout` and the `_punica_metadata_prepared` state are
 frozen into the compiled forward at first compile; the Punica fallback for

@@ -389,6 +389,39 @@ class PunicaWrapperGPU(PunicaWrapperBase):
 
         y = y.view_as(y_org)
 
+    def _add_lora_embedding_rollout(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        lora_b_stacked: torch.Tensor,
+        add_inputs: bool,
+    ) -> bool:
+        """Single-adapter torch path for the embedding. Returns False to fall
+        back to Punica.
+
+        ``VocabParallelEmbeddingWithLoRA`` has already applied LoRA-A with a plain
+        ``F.embedding`` lookup, so ``x`` is ``(tokens, rank)`` and all that is left
+        is ``y += x @ B.T`` for the one active slot. Doing it in torch keeps the
+        Punica metadata preparation, with its data-dependent ``no_lora`` branch
+        and device-to-host sync, out of the compiled forward: under the fast
+        path ``update_metadata`` skips that preparation on purpose, and vLLM
+        compiles with fullgraph capture, so the first vanilla-Punica op to
+        request it inside the forward used to abort engine start.
+        """
+        lora_index = self._rollout_single_lora_index
+        if lora_index is None:
+            return False
+        # lora_b_stacked: (max_loras, 1, embedding_dim, rank)
+        lora_b = lora_b_stacked[lora_index, 0]
+        lora_output = torch.matmul(x.to(dtype=lora_b.dtype), lora_b.t()).to(
+            dtype=y.dtype
+        )
+        if add_inputs:
+            y.add_(lora_output)
+        else:
+            y.copy_(lora_output)
+        return True
+
     def add_lora_embedding(
         self,
         y: torch.Tensor,
@@ -410,6 +443,10 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             add_inputs (bool): Default to True.
         """
 
+        if self._rollout_fast_path_enabled and self._add_lora_embedding_rollout(
+            y, x, lora_b_stacked, add_inputs
+        ):
+            return
         self._ensure_punica_metadata_prepared()
         lora_expand(
             x.unsqueeze(dim=0),
@@ -501,6 +538,34 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             **kwargs,
         )
 
+    def _add_lora_logits_rollout(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        lora_a_stacked: torch.Tensor,
+        lora_b_stacked: torch.Tensor,
+        scale: float,
+    ) -> bool:
+        """Single-adapter torch path for the LM head. Returns False to fall back
+        to Punica. Same reasoning as :meth:`_add_lora_embedding_rollout`; the
+        sampler rows all belong to the one active adapter, so the per-request
+        prompt mapping the vanilla path needs carries no information here.
+        """
+        lora_index = self._rollout_single_lora_index
+        if lora_index is None:
+            return False
+        # lora_a_stacked: (max_loras, 1, rank, hidden)
+        # lora_b_stacked: (max_loras, 1, vocab, rank)
+        lora_output = rollout_lora_matmul(
+            x,
+            lora_a_stacked[lora_index, 0],
+            lora_b_stacked[lora_index, 0],
+            y.shape[-1],
+            scale,
+        ).to(dtype=y.dtype)
+        y.add_(lora_output)
+        return True
+
     def add_lora_logits(
         self,
         y: torch.Tensor,
@@ -530,6 +595,10 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         y_org = y
         y = y.view(-1, y.shape[-1])
         x = x.view(-1, x.shape[-1])
+        if self._rollout_fast_path_enabled and self._add_lora_logits_rollout(
+            y, x, lora_a_stacked, lora_b_stacked, scale
+        ):
+            return
         self._ensure_punica_metadata_prepared()
         r = lora_b_stacked.size(-1)
 

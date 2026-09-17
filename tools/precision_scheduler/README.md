@@ -57,7 +57,8 @@ BF16-prefix / W4-suffix plans.
 | `--initial-precision-warmup-steps` | 9 | untimed priming |
 | `--gpu-memory-utilization` | 0.5 | archived runs used 0.5 |
 | `--max-model-len` | `max(seq) + warmup + measure + 2` | |
-| `--full-cudagraph-without-torch-compile` | off | Phi-4-mini and Gemma lanes set it; Qwen3.5 did not |
+| `--full-cudagraph-without-torch-compile` | off | Phi-4-mini and Gemma lanes set it; Qwen3.5 did not. **No longer needed for the fast path**: it was working around a compile crash in the embedding LoRA path that the wrapper now handles, and on the PRO 6000 it costs ~4 ms/token on every row, flattening BF16/INT4 at batch 1 / 1k from 1.55x to 1.27x |
+| `--lora-target-modules` | unset | comma-separated, as the verl overlay passes them; unset wraps every supported module, embedding included |
 | `--synthetic-float-value` / `--synthetic-integer-value` | 0.015 / 1 | must be non-zero |
 | `--no-language-model-only` | off | multimodal checkpoints load the text tower only by default |
 

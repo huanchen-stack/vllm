@@ -678,3 +678,123 @@ def test_dual_stream_lora_first_and_override_precedence(
     async_spy.assert_called_once()
     override_spy.assert_called_once()
     torch.testing.assert_close(out, reference, rtol=rtol, atol=atol)
+
+
+# --------------------------------------------------------------------------
+# embedding and LM-head fast paths
+# --------------------------------------------------------------------------
+#
+# ``update_metadata`` skips the Punica metadata preparation on the fast path,
+# and vLLM compiles the forward with fullgraph capture. Any vanilla-Punica op that
+# then asks for that metadata inside the forward trips ``prepare_tensors``'s
+# data-dependent ``no_lora`` branch and aborts engine start. The embedding and
+# LM-head LoRA layers are the two ops the linear fast path did not cover.
+
+
+def _single_adapter_wrapper(monkeypatch, dtype: torch.dtype, rank: int):
+    monkeypatch.setenv("ROLLOUT_QLORA", "1")
+    lora_config = LoRAConfig(max_loras=MAX_LORAS, max_lora_rank=rank, lora_dtype=dtype)
+    wrapper = _make_wrapper(lora_config)
+    id_to_index: list[int | None] = [None] * MAX_LORAS
+    id_to_index[SLOT] = LORA_ID
+    return wrapper, id_to_index
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_embedding_fast_path_matches_punica(dist_init, monkeypatch, dtype):
+    set_random_seed(0)
+    rank, tokens, embedding_dim = 8, 16, 96
+    wrapper, id_to_index = _single_adapter_wrapper(monkeypatch, dtype, rank)
+    mapping = LoRAMapping([LORA_ID] * tokens, [LORA_ID] * 2, is_prefill=False)
+    wrapper.update_metadata(mapping, id_to_index, MAX_LORAS, 512)
+    assert wrapper._rollout_single_lora_index == SLOT
+    token_spy, _ = _spy_prepare(wrapper)
+
+    # A non-zero B in the live slot and garbage in the other, so a wrong slot or
+    # a wrong transpose cannot pass by accident.
+    # Same scaling as the linear tests above (uniform, centred, B x 0.1), which
+    # keeps the LoRA delta at order one so the tolerances mean what they say.
+    lora_b = (torch.rand(MAX_LORAS, 1, embedding_dim, rank, device=DEVICE) - 0.5) * 0.1
+    lora_b = lora_b.to(dtype)
+    x = (torch.rand(tokens, rank, device=DEVICE) - 0.5).to(dtype)  # LoRA-A applied
+    base = (torch.rand(tokens, embedding_dim, device=DEVICE) - 0.5).to(dtype)
+
+    y_fast = base.clone()
+    wrapper.add_lora_embedding(y_fast, x, lora_b, add_inputs=True)
+    assert token_spy.call_count == 0, "fast path must not prepare Punica metadata"
+
+    # Reference: the vanilla Punica kernel on the same inputs.
+    monkeypatch.setattr(wrapper, "_rollout_fast_path_enabled", False)
+    y_ref = base.clone()
+    wrapper.add_lora_embedding(y_ref, x, lora_b, add_inputs=True)
+    assert token_spy.call_count == 1
+
+    rtol, atol = TOLERANCES[dtype]
+    torch.testing.assert_close(y_fast, y_ref, rtol=rtol, atol=atol)
+    expected = base.float() + x.float() @ lora_b[SLOT, 0].float().T
+    torch.testing.assert_close(y_fast, expected.to(dtype), rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_logits_fast_path_matches_punica(dist_init, monkeypatch, dtype):
+    set_random_seed(0)
+    rank, rows, hidden, vocab, scale = 8, 4, 64, 160, 0.5
+    wrapper, id_to_index = _single_adapter_wrapper(monkeypatch, dtype, rank)
+    mapping = LoRAMapping([LORA_ID] * 16, [LORA_ID] * rows, is_prefill=False)
+    wrapper.update_metadata(mapping, id_to_index, MAX_LORAS, 512)
+    assert wrapper._rollout_single_lora_index == SLOT
+    _, prompt_spy = _spy_prepare(wrapper)
+
+    lora_a = (torch.rand(MAX_LORAS, 1, rank, hidden, device=DEVICE) - 0.5).to(dtype)
+    lora_b = ((torch.rand(MAX_LORAS, 1, vocab, rank, device=DEVICE) - 0.5) * 0.1).to(
+        dtype
+    )
+    x = (torch.rand(rows, hidden, device=DEVICE) - 0.5).to(dtype)
+    base = (torch.rand(rows, vocab, device=DEVICE) - 0.5).to(dtype)
+
+    y_fast = base.clone()
+    wrapper.add_lora_logits(y_fast, x, lora_a, lora_b, scale)
+    assert prompt_spy.call_count == 0, "fast path must not prepare Punica metadata"
+
+    monkeypatch.setattr(wrapper, "_rollout_fast_path_enabled", False)
+    y_ref = base.clone()
+    wrapper.add_lora_logits(y_ref, x, lora_a, lora_b, scale)
+    assert prompt_spy.call_count == 1
+
+    rtol, atol = TOLERANCES[dtype]
+    # The fast path against the kernel it replaces: this is the real check.
+    torch.testing.assert_close(y_fast, y_ref, rtol=rtol, atol=atol)
+    # And the kernel against the closed form, to pin slot, transpose and scale.
+    # Punica accumulates its shrink output in fp32, so it is the one to compare
+    # with an fp32 formula; the fast path keeps the rank-sized intermediate in
+    # the weight dtype and can differ from fp32 by more than a bf16 ulp.
+    expected = base.float() + (x.float() @ lora_a[SLOT, 0].float().T * scale) @ (
+        lora_b[SLOT, 0].float().T
+    )
+    # Both kernels store the result in the output dtype, so round the closed
+    # form the same way; otherwise a single large logit is off by one bf16 ulp.
+    torch.testing.assert_close(y_ref, expected.to(dtype), rtol=rtol, atol=atol)
+
+
+def test_embedding_and_logits_fall_back_on_multi_adapter(dist_init, monkeypatch):
+    """A mixed batch has no single slot, so both ops must take the Punica path."""
+    wrapper, id_to_index = _single_adapter_wrapper(monkeypatch, torch.float16, 8)
+    id_to_index[0] = LORA_ID + 1
+    mixed = LoRAMapping([LORA_ID] * 4 + [LORA_ID + 1] * 4, [LORA_ID, LORA_ID + 1])
+    wrapper.update_metadata(mixed, id_to_index, MAX_LORAS, 512)
+    assert wrapper._rollout_single_lora_index is None
+    lora_b = torch.zeros(MAX_LORAS, 1, 32, 8, dtype=torch.float16, device=DEVICE)
+    assert not wrapper._add_lora_embedding_rollout(
+        torch.zeros(8, 32, dtype=torch.float16, device=DEVICE),
+        torch.zeros(8, 8, dtype=torch.float16, device=DEVICE),
+        lora_b,
+        True,
+    )
+    lora_a = torch.zeros(MAX_LORAS, 1, 8, 16, dtype=torch.float16, device=DEVICE)
+    assert not wrapper._add_lora_logits_rollout(
+        torch.zeros(2, 32, dtype=torch.float16, device=DEVICE),
+        torch.zeros(2, 16, dtype=torch.float16, device=DEVICE),
+        lora_a,
+        lora_b,
+        1.0,
+    )
