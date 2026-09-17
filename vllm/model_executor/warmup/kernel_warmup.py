@@ -112,6 +112,30 @@ def kernel_warmup(worker: "Worker"):
 _FLASHINFER_USE_PERSISTENT_CACHE = False
 
 
+def _autotune_base_precisions(runner: "GPUModelRunner") -> list[str | None]:
+    """Base precisions to run the autotune forward under.
+
+    ``[None]`` on a vanilla runner (bind nothing, as before). With dual
+    precision, BF16 first and then the shadow, so that both sets of GEMM
+    kernels are exercised inside the autotune context.
+    """
+    if not getattr(runner, "dual_precision_enabled", False):
+        return [None]
+    from vllm.model_executor.dual_precision import (
+        BASE_PRECISION_BF16,
+        BASE_PRECISION_INT4,
+    )
+
+    return [BASE_PRECISION_BF16, BASE_PRECISION_INT4]
+
+
+def _restore_bf16(runner: "GPUModelRunner") -> None:
+    """Leave the wrappers bound to BF16, the state every later stage expects."""
+    restore = getattr(runner, "_restore_bf16_binding", None)
+    if restore is not None:
+        restore()
+
+
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     """
     Autotune FlashInfer operations.
@@ -128,13 +152,24 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     import vllm.utils.flashinfer as fi_utils
     from vllm.distributed.parallel_state import get_world_group
 
+    # Dual precision: a dummy run binds nothing unless told to, so it executes
+    # whatever is bound at start-up, the BF16 base. The quantized shadow's
+    # kernels then never run inside the autotune context and keep FlashInfer's
+    # untuned default tactics. Measured on Phi-4-mini with an NVFP4 shadow: the
+    # untuned Cutlass GEMM ran 24 us per call at batch 1 against 8-17 us tuned,
+    # 1.5 ms per token across 128 linears. Tune under every base precision.
+    base_precisions = _autotune_base_precisions(runner)
+
     if not _FLASHINFER_USE_PERSISTENT_CACHE:
         with torch.inference_mode(), fi_utils.autotune():
-            runner._dummy_run(
-                num_tokens=runner.scheduler_config.max_num_batched_tokens,
-                skip_eplb=True,
-                is_profile=True,
-            )
+            for base_precision in base_precisions:
+                runner._dummy_run(
+                    num_tokens=runner.scheduler_config.max_num_batched_tokens,
+                    skip_eplb=True,
+                    is_profile=True,
+                    base_precision=base_precision,
+                )
+        _restore_bf16(runner)
         get_world_group().barrier()
         return
 
@@ -158,9 +193,12 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     with torch.inference_mode():
         if is_leader:
             with fi_utils.autotune(tune_mode=True, cache=str(cache_path)):
-                runner._dummy_run(**dummy_run_kwargs)
+                for base_precision in base_precisions:
+                    runner._dummy_run(**dummy_run_kwargs, base_precision=base_precision)
         else:
-            runner._dummy_run(**dummy_run_kwargs)
+            for base_precision in base_precisions:
+                runner._dummy_run(**dummy_run_kwargs, base_precision=base_precision)
+    _restore_bf16(runner)
 
     # Broadcast autotune cache from rank 0 to all other ranks so every
     # rank loads the same set of chosen tactics.
