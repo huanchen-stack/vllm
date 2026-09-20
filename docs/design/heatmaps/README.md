@@ -1,4 +1,4 @@
-# TPOT heatmaps (Qwen3.5-9B, A100-80GB, gmem 0.5, LoRA rank 16, all layers INT4)
+# TPOT heatmaps (A100-80GB, gmem 0.5, LoRA rank 16, all layers INT4)
 
 Produced by `tools/precision_scheduler/tpot_heatmap.py` (batch 1,2,4,8,16,32,64 x context
 512..16384, 2 warm-up + 9 measured decode steps x 3 repetitions per cell, synthetic KV,
@@ -18,3 +18,18 @@ batch 64 at 8k+; INT4 also 32 x 12k and 64 x 6-7k, since the shadow takes weight
 
 Every scheduler run before 2026-09-17 used the sync heatmap and the sync LoRA path; runs from
 the dual-stream heatmap onwards should cite this file.
+
+## All three models on the dual-stream backend (2026-09-20)
+
+`qwen35_4b_ours_dualstream_2026-09-20.json` and `phi4_mini_ours_dualstream_2026-09-20.json` were
+re-recorded with the same harness and backend (~8 min each); `speedup_3models_dualstream_2026-09-20.png`
+shows the three speedup grids side by side. Median INT4 gain per batch size:
+
+| model | b1 | b2 | b4 | b8 | b16 | b32 | b64 | BF16 -> INT4 TPOT at b1 / 512 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Qwen3.5-9B | 48 % | 39 % | 39 % | 38 % | 31 % | 28 % | 7 % | 13.7 -> 9.4 ms |
+| Qwen3.5-4B | 29 % | 25 % | 25 % | 24 % | 16 % | 13 % | 2 % | 9.8 -> 7.6 ms |
+| Phi-4-mini-reasoning | 19 % | 15 % | 16 % | 15 % | 12 % | 7 % | 6 % | 9.2 -> 7.2 ms |
+
+The Qwen grids are flat across context (weight-bandwidth bound); Phi's gain decays with context
+(29 % -> 10 % at batch 1) as its attention dominates, so the late-tail switch buys less there.
